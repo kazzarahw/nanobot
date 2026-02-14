@@ -41,7 +41,11 @@ class ExecTool(Tool):
 
     @property
     def description(self) -> str:
-        return "Execute a shell command and return its output. Use with caution."
+        return (
+            "Execute a shell command and return its output. "
+            "To run a command in a specific directory, set working_dir — "
+            "do NOT prefix the command with 'cd <dir> &&'."
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -51,7 +55,10 @@ class ExecTool(Tool):
                 "command": {"type": "string", "description": "The shell command to execute"},
                 "working_dir": {
                     "type": "string",
-                    "description": "Optional working directory for the command",
+                    "description": (
+                        "Directory to run the command in. Use this instead of "
+                        "'cd <path> && ...' in the command string."
+                    ),
                 },
             },
             "required": ["command"],
