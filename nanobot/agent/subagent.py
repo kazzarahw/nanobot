@@ -1,7 +1,6 @@
 """Subagent manager for background task execution."""
 
 import asyncio
-import json
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,7 +14,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import LatentLoopConfig
+    from nanobot.config.schema import ExecToolConfig, LatentLoopConfig
 
 
 class SubagentManager:
@@ -35,6 +34,8 @@ class SubagentManager:
         model: str | None = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        max_input_tokens: int = 120000,
+        trim_reserved_output_tokens: int = 4096,
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
@@ -48,6 +49,8 @@ class SubagentManager:
         self.model = model or provider.get_default_model()
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.max_input_tokens = max_input_tokens
+        self.trim_reserved_output_tokens = trim_reserved_output_tokens
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
@@ -128,6 +131,8 @@ class SubagentManager:
                 max_iterations=15,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
+                max_input_tokens=self.max_input_tokens,
+                trim_reserved_output_tokens=self.trim_reserved_output_tokens,
                 latent_config=self.latent_config,
                 enable_circuit_breaker=False,
                 log_prefix=f"Subagent [{task_id}] ",

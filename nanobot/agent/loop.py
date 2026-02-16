@@ -11,8 +11,8 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.react import run_react_loop
+from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry, register_core_tools
@@ -48,6 +48,8 @@ class AgentLoop:
         max_iterations: int = 20,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        max_input_tokens: int = 120000,
+        trim_reserved_output_tokens: int = 4096,
         memory_window: int = 50,
         brave_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
@@ -66,6 +68,8 @@ class AgentLoop:
         self.max_iterations = max_iterations
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.max_input_tokens = max_input_tokens
+        self.trim_reserved_output_tokens = trim_reserved_output_tokens
         self.memory_window = memory_window
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
@@ -93,6 +97,8 @@ class AgentLoop:
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            max_input_tokens=self.max_input_tokens,
+            trim_reserved_output_tokens=self.trim_reserved_output_tokens,
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
@@ -160,6 +166,8 @@ class AgentLoop:
             max_iterations=self.max_iterations,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            max_input_tokens=self.max_input_tokens,
+            trim_reserved_output_tokens=self.trim_reserved_output_tokens,
             latent_config=self.latent_config,
             enable_circuit_breaker=True,
             log_prefix="",

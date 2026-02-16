@@ -17,6 +17,7 @@ from nanobot.agent.latent import (
     incorporate_tool_results,
     run_latent_passes,
 )
+from nanobot.agent.context_window import prepare_action_messages
 from nanobot.config.schema import LatentLoopConfig
 from nanobot.providers.base import LLMResponse
 
@@ -316,6 +317,9 @@ class TestLatentLoopConfig:
         assert config.condense_tool_results is True
         assert config.inject_state is True
         assert config.warmup_threshold == 0
+        assert config.disable_on_instability is True
+        assert config.instability_parse_fail_threshold == 3
+        assert config.instability_window_iterations == 8
 
     def test_agent_defaults_has_latent_loop(self) -> None:
         from nanobot.config.schema import AgentDefaults
@@ -597,6 +601,26 @@ class TestRunLatentPasses:
         assert reasoner.metrics.total_passes == 1
         assert reasoner.metrics.converged_early == 1
 
+    @pytest.mark.asyncio
+    async def test_parse_failure_does_not_count_as_convergence(self) -> None:
+        provider = AsyncMock()
+        provider.chat = AsyncMock(return_value=LLMResponse(content="not json"))
+        config = _default_config(max_latent_passes=3)
+        reasoner = LatentReasoner(provider, "m", config)
+        initial_state = LatentState(plan="stable")
+
+        complex_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Write a Python script to implement a file parser and search through all the data"},
+        ]
+        state, _ = await run_latent_passes(
+            reasoner, initial_state, config, complex_messages, iteration=1,
+        )
+
+        assert state.plan == "stable"
+        assert reasoner.metrics.converged_early == 0
+        assert reasoner.metrics.parse_failures >= 1
+
 
 class TestIncorporateToolResults:
     @pytest.mark.asyncio
@@ -818,6 +842,31 @@ class TestBudgetExhaustion:
         # Should converge after 1 pass since plans are very similar
         assert reasoner.metrics.converged_early >= 1
 
+    @pytest.mark.asyncio
+    async def test_instability_disables_latent(self) -> None:
+        provider = AsyncMock()
+        provider.chat = AsyncMock(return_value=LLMResponse(content="bad json"))
+        config = _default_config(
+            max_latent_passes=2,
+            disable_on_instability=True,
+            instability_parse_fail_threshold=2,
+            instability_window_iterations=4,
+        )
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="original")
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Write code and test and deploy"},
+        ]
+
+        state, _ = await run_latent_passes(reasoner, state, config, messages, iteration=1)
+        assert reasoner.disabled_due_to_instability is True
+
+        prev_passes = reasoner.metrics.total_passes
+        _, action_messages = await run_latent_passes(reasoner, state, config, messages, iteration=2)
+        assert reasoner.metrics.total_passes == prev_passes
+        assert action_messages == messages
+
 
 # ── Adaptive complexity estimation tests ─────────────────────────────
 
@@ -864,6 +913,14 @@ class TestEstimateComplexity:
         # No refinement calls should have been made
         assert reasoner.metrics.total_passes == 0
         assert result_state.plan == "original"
+
+    def test_ignores_internal_user_prompts(self) -> None:
+        messages = [
+            {"role": "user", "content": "Write a script to build and deploy with tests"},
+            {"role": "user", "content": "Tool calls succeeded. Proceed.", "_internal": "reflect"},
+        ]
+        c = LatentReasoner._estimate_complexity(messages)
+        assert c >= 2
 
 
 # ── New config fields tests ──────────────────────────────────────────
@@ -943,3 +1000,49 @@ class TestRegistryEnhancedErrors:
         result = await registry.execute("bad_tool", {})
         assert "STOP" in result
         assert "3 times" in result
+
+
+# ── Context window trimming tests ─────────────────────────────────────
+
+
+class TestActionContextWindow:
+    def test_keeps_system_real_user_and_tool_chain(self) -> None:
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old user"},
+            {"role": "assistant", "content": "thinking", "tool_calls": [{"id": "1"}]},
+            {"role": "tool", "content": "x" * 4000, "tool_call_id": "1", "name": "exec"},
+            {"role": "user", "content": "Tool calls succeeded", "_internal": "reflect"},
+            {"role": "user", "content": "current real request"},
+        ]
+
+        trimmed = prepare_action_messages(messages, max_input_tokens=400, reserve_tokens=50)
+        out = trimmed.messages
+
+        assert out[0]["role"] == "system"
+        assert any(m["role"] == "assistant" and m.get("tool_calls") for m in out)
+        assert any(m["role"] == "tool" for m in out)
+        assert any(m["role"] == "user" and m["content"] == "current real request" for m in out)
+        assert not any(m["role"] == "user" and m["content"] == "Tool calls succeeded" for m in out)
+
+    def test_strips_internal_metadata_before_provider(self) -> None:
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hello", "_internal": "reflect"},
+        ]
+        trimmed = prepare_action_messages(messages, max_input_tokens=1000, reserve_tokens=50)
+        assert "_internal" not in trimmed.messages[1]
+
+    def test_keeps_latent_state_system_message_when_present(self) -> None:
+        latent_state = "## Latent Reasoning State  (iteration 1, 1 refinements)\n\n**Plan:** x"
+        messages = [
+            {"role": "system", "content": "main system"},
+            {"role": "system", "content": latent_state},
+            {"role": "user", "content": "do work"},
+            {"role": "assistant", "content": "a" * 8000},
+        ]
+        trimmed = prepare_action_messages(messages, max_input_tokens=400, reserve_tokens=50)
+        assert any(
+            m["role"] == "system" and "## Latent Reasoning State" in m["content"]
+            for m in trimmed.messages
+        )

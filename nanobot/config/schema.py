@@ -195,6 +195,9 @@ class LatentLoopConfig(BaseModel):
     max_total_latent_tokens: int = 50_000  # Session-wide token budget for latent passes
     max_total_refinements: int = 30  # Total refinement cap across all iterations
     convergence_similarity: float = 0.85  # Fuzzy match threshold for plan convergence
+    disable_on_instability: bool = True
+    instability_parse_fail_threshold: int = 3
+    instability_window_iterations: int = 8
     plan_drift_keywords: list[str] = Field(
         default_factory=lambda: [
             "schedule meeting",
@@ -212,6 +215,8 @@ class AgentDefaults(BaseModel):
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     max_tokens: int = 8192
+    max_input_tokens: int = 120000
+    trim_reserved_output_tokens: int = 4096
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50

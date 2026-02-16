@@ -94,6 +94,7 @@ class LatentMetrics:
     converged_early: int = 0
     initialization_tokens: int = 0
     condensation_calls: int = 0
+    parse_failures: int = 0
 
 
 @dataclass
@@ -105,6 +106,7 @@ class LatentState:
     uncertainties: list[str] = field(default_factory=list)
     iteration: int = 0
     refinement_count: int = 0
+    last_refine_ok: bool = True
 
     # ── Serialization helpers ────────────────────────────────────────
 
@@ -247,6 +249,8 @@ class LatentReasoner:
         self.model = model
         self.config = config
         self.metrics = LatentMetrics()
+        self.disabled_due_to_instability = False
+        self._parse_fail_iterations: list[int] = []
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -257,7 +261,7 @@ class LatentReasoner:
             {"role": "system", "content": _INIT_PROMPT},
             {"role": "user", "content": condensed},
         ]
-        state = await self._call_for_state(prompt_messages)
+        state, _ = await self._call_for_state(prompt_messages)
         logger.debug(f"Latent state initialized: plan={state.plan!r:.80}")
         return state
 
@@ -273,9 +277,10 @@ class LatentReasoner:
             {"role": "system", "content": prompt},
             {"role": "user", "content": condensed},
         ]
-        new_state = await self._call_for_state(prompt_messages, fallback=state)
+        new_state, parse_ok = await self._call_for_state(prompt_messages, fallback=state)
         new_state.iteration = state.iteration
         new_state.refinement_count = state.refinement_count + 1
+        new_state.last_refine_ok = parse_ok
         self.metrics.total_passes += 1
         logger.debug(
             f"Latent refinement #{new_state.refinement_count}: plan={new_state.plan!r:.80}"
@@ -304,7 +309,7 @@ class LatentReasoner:
             {"role": "system", "content": prompt},
             {"role": "user", "content": "Update the reasoning state with these tool results."},
         ]
-        new_state = await self._call_for_state(prompt_messages, fallback=state)
+        new_state, _ = await self._call_for_state(prompt_messages, fallback=state)
         new_state.iteration = state.iteration
         new_state.refinement_count = state.refinement_count
         self.metrics.condensation_calls += 1
@@ -369,17 +374,8 @@ class LatentReasoner:
         2 = moderate task
         3 = complex multi-step task
         """
-        # Extract the last user message
-        user_text = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, list):
-                    content = " ".join(
-                        part.get("text", "") for part in content if isinstance(part, dict)
-                    )
-                user_text = content
-                break
+        # Extract the last real user message, ignoring internal loop prompts.
+        user_text = LatentReasoner._latest_real_user_text(messages)
 
         if not user_text:
             return 0
@@ -405,13 +401,29 @@ class LatentReasoner:
             return 3
         return 2
 
+    @staticmethod
+    def _latest_real_user_text(messages: list[dict]) -> str:
+        """Return latest user text that did not originate from internal prompts."""
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            if msg.get("_internal"):
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    part.get("text", "") for part in content if isinstance(part, dict)
+                )
+            return content if isinstance(content, str) else str(content)
+        return ""
+
     # ── Internals ────────────────────────────────────────────────────
 
     async def _call_for_state(
         self,
         messages: list[dict],
         fallback: LatentState | None = None,
-    ) -> LatentState:
+    ) -> tuple[LatentState, bool]:
         """Call the LLM and parse the response into a LatentState.
 
         Retries once on transient network errors.  On any parse failure
@@ -436,7 +448,7 @@ class LatentReasoner:
 
                 text = (response.content or "").strip()
                 data = self._parse_json(text)
-                return LatentState.from_dict(data)
+                return LatentState.from_dict(data), True
             except _TRANSIENT_EXCEPTIONS as e:
                 last_exc = e
                 if attempt == 0:
@@ -444,14 +456,15 @@ class LatentReasoner:
                     await asyncio.sleep(2)
                     continue
                 logger.warning(f"Latent call failed after retry ({e}), keeping previous state")
-                return fallback if fallback is not None else LatentState()
+                return fallback if fallback is not None else LatentState(), False
             except Exception as e:
+                self.metrics.parse_failures += 1
                 logger.warning(f"Latent state parse failed ({e}), keeping previous state")
-                return fallback if fallback is not None else LatentState()
+                return fallback if fallback is not None else LatentState(), False
 
         # Should not be reached, but guard against it.
         logger.warning(f"Latent call exhausted retries ({last_exc}), keeping previous state")
-        return fallback if fallback is not None else LatentState()
+        return fallback if fallback is not None else LatentState(), False
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
@@ -503,6 +516,8 @@ class LatentReasoner:
         priority: list[dict] = []
         tools: list[dict] = []
         for msg in messages:
+            if msg.get("_internal"):
+                continue
             role = msg.get("role", "")
             if role in ("tool",):
                 tools.append(msg)
@@ -573,6 +588,8 @@ async def run_latent_passes(
     """
     if reasoner is None or state is None or config is None:
         return state, messages
+    if reasoner.disabled_due_to_instability:
+        return state, messages
 
     # Adaptive complexity: skip latent passes for trivial queries
     complexity = LatentReasoner._estimate_complexity(messages)
@@ -598,10 +615,31 @@ async def run_latent_passes(
 
             prev_plan = state.plan
             state = await reasoner.refine(state, messages)
+            if not state.last_refine_ok:
+                reasoner._parse_fail_iterations.append(iteration)
+                window = max(1, config.instability_window_iterations)
+                min_iteration = max(1, iteration - window + 1)
+                reasoner._parse_fail_iterations = [
+                    i for i in reasoner._parse_fail_iterations if i >= min_iteration
+                ]
+                if (
+                    config.disable_on_instability
+                    and len(reasoner._parse_fail_iterations)
+                    >= config.instability_parse_fail_threshold
+                ):
+                    reasoner.disabled_due_to_instability = True
+                    logger.warning(
+                        "Latent disabled due to instability: "
+                        f"{len(reasoner._parse_fail_iterations)} parse failures within "
+                        f"{window} iterations"
+                    )
+                    break
+                # Parse failed; keep outer loop moving but do not treat as convergence.
+                continue
 
             # Drift detection
             if LatentReasoner._detect_plan_drift(state.plan, config.plan_drift_keywords):
-                logger.warning(f"Plan drift detected, reverting to previous plan")
+                logger.warning("Plan drift detected, reverting to previous plan")
                 state = LatentState(
                     plan=prev_plan,
                     key_observations=state.key_observations,
@@ -621,7 +659,7 @@ async def run_latent_passes(
                 break
 
     action_messages = messages
-    if config.inject_state:
+    if config.inject_state and not reasoner.disabled_due_to_instability:
         action_messages = reasoner.inject(state, messages)
     return state, action_messages
 

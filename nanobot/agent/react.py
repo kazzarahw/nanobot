@@ -5,6 +5,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.context_window import prepare_action_messages
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider
 
@@ -32,6 +33,8 @@ async def run_react_loop(
     max_iterations: int,
     temperature: float,
     max_tokens: int,
+    max_input_tokens: int | None,
+    trim_reserved_output_tokens: int,
     latent_config: Any | None,
     enable_circuit_breaker: bool = True,
     log_prefix: str = "",
@@ -53,6 +56,8 @@ async def run_react_loop(
         max_iterations: Maximum number of iterations.
         temperature: Temperature for sampling.
         max_tokens: Maximum tokens per response.
+        max_input_tokens: Input token budget for action calls.
+        trim_reserved_output_tokens: Reserved completion headroom.
         latent_config: Latent loop configuration (or None to disable).
         enable_circuit_breaker: Whether to use error circuit breaker.
         log_prefix: Prefix for log messages (e.g., "Subagent [abc123] ").
@@ -89,9 +94,20 @@ async def run_react_loop(
         latent_state, action_messages = await run_latent_passes(
             latent, latent_state, latent_config, messages, iteration,
         )
+        trimmed = prepare_action_messages(
+            action_messages,
+            max_input_tokens=max_input_tokens,
+            reserve_tokens=trim_reserved_output_tokens,
+        )
+        if trimmed.before_tokens != trimmed.after_tokens:
+            logger.debug(
+                f"{log_prefix}Trimmed action context: "
+                f"{trimmed.before_tokens} -> {trimmed.after_tokens} tokens "
+                f"(dropped internal={trimmed.dropped_internal}, other={trimmed.dropped_other})"
+            )
 
         response = await provider.chat(
-            messages=action_messages,
+            messages=trimmed.messages,
             tools=tools.get_definitions(),
             model=model,
             temperature=temperature,
@@ -163,7 +179,7 @@ async def run_react_loop(
 
             # ── Contextual reflect prompt ──
             reflect = _build_reflect_prompt(has_errors, error_summaries)
-            messages.append({"role": "user", "content": reflect})
+            messages.append({"role": "user", "content": reflect, "_internal": "reflect"})
 
             # ── Error circuit breaker ──
             if enable_circuit_breaker and has_errors:
@@ -180,6 +196,7 @@ async def run_react_loop(
                         "Do NOT repeat the same failing calls."
                     )
                     messages.append({"role": "user", "content": intervention})
+                    messages[-1]["_internal"] = "intervention"
                     logger.warning(f"{log_prefix}Circuit breaker triggered after {consecutive_error_count} error iterations")
                     consecutive_error_count = 0
                     recent_errors.clear()
