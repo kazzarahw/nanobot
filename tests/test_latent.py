@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
-from nanobot.agent.latent import LatentReasoner, LatentState
+from nanobot.agent.latent import (
+    LatentMetrics,
+    LatentReasoner,
+    LatentState,
+    _repair_truncated_json,
+    incorporate_tool_results,
+    run_latent_passes,
+)
 from nanobot.config.schema import LatentLoopConfig
 from nanobot.providers.base import LLMResponse
 
@@ -178,20 +186,20 @@ class TestLatentReasoner:
 
     @pytest.mark.asyncio
     async def test_incorporate_truncates_long_results(self) -> None:
-        """Tool results longer than 1000 chars are truncated in the prompt."""
+        """Tool results longer than per-tool limit are truncated in the prompt."""
         provider = _make_provider()
         reasoner = LatentReasoner(provider, "test-model", _default_config())
         state = LatentState(plan="p")
 
-        long_result = "x" * 2000
+        long_result = "x" * 5000
         await reasoner.incorporate_observations(state, [("exec", long_result)])
 
-        # Check that the prompt sent to the LLM has the truncated result
+        # exec has a 2000-char per-tool limit
         call_args = provider.chat.call_args
         prompt_messages = call_args.kwargs.get("messages") or call_args.args[0]
         system_content = prompt_messages[0]["content"]
-        assert "x" * 1000 in system_content
-        assert "x" * 1001 not in system_content
+        assert "x" * 2000 in system_content
+        assert "x" * 2001 not in system_content
 
     def test_inject_inserts_after_system(self) -> None:
         reasoner = LatentReasoner(AsyncMock(), "m", _default_config())
@@ -316,3 +324,346 @@ class TestLatentLoopConfig:
         assert hasattr(defaults, "latent_loop")
         assert isinstance(defaults.latent_loop, LatentLoopConfig)
         assert defaults.latent_loop.enabled is False
+
+    def test_latent_model_defaults_to_none(self) -> None:
+        config = LatentLoopConfig()
+        assert config.latent_model is None
+
+    def test_latent_model_can_be_set(self) -> None:
+        config = LatentLoopConfig(latent_model="anthropic/claude-haiku")
+        assert config.latent_model == "anthropic/claude-haiku"
+
+
+# ── from_dict type coercion tests ─────────────────────────────────────
+
+
+class TestFromDictTypeCoercion:
+    def test_plan_coerced_to_str(self) -> None:
+        state = LatentState.from_dict({"plan": 42})
+        assert state.plan == "42"
+
+    def test_observations_string_becomes_list(self) -> None:
+        state = LatentState.from_dict({"key_observations": "single observation"})
+        assert state.key_observations == ["single observation"]
+
+    def test_uncertainties_string_becomes_list(self) -> None:
+        state = LatentState.from_dict({"uncertainties": "one question"})
+        assert state.uncertainties == ["one question"]
+
+    def test_observations_non_list_non_str_becomes_empty(self) -> None:
+        state = LatentState.from_dict({"key_observations": 123})
+        assert state.key_observations == []
+
+    def test_nested_non_str_items_coerced(self) -> None:
+        state = LatentState.from_dict({"key_observations": [1, True, "ok"]})
+        assert state.key_observations == ["1", "True", "ok"]
+
+
+# ── JSON repair tests ────────────────────────────────────────────────
+
+
+class TestRepairTruncatedJson:
+    def test_unterminated_string(self) -> None:
+        text = '{"plan": "do stu'
+        repaired = _repair_truncated_json(text)
+        assert repaired is not None
+        data = json.loads(repaired)
+        assert data["plan"] == "do stu"
+
+    def test_unclosed_array(self) -> None:
+        text = '{"key_observations": ["a", "b"'
+        repaired = _repair_truncated_json(text)
+        assert repaired is not None
+        data = json.loads(repaired)
+        assert data["key_observations"] == ["a", "b"]
+
+    def test_missing_closing_brace(self) -> None:
+        text = '{"plan": "done", "key_observations": ["x"]'
+        repaired = _repair_truncated_json(text)
+        assert repaired is not None
+        data = json.loads(repaired)
+        assert data["plan"] == "done"
+
+    def test_unterminated_string_in_array(self) -> None:
+        text = '{"plan": "ok", "key_observations": ["a", "trun'
+        repaired = _repair_truncated_json(text)
+        assert repaired is not None
+        data = json.loads(repaired)
+        assert "a" in data["key_observations"]
+
+    def test_valid_json_returned_unchanged(self) -> None:
+        text = '{"plan": "ok"}'
+        repaired = _repair_truncated_json(text)
+        assert repaired is not None
+        assert json.loads(repaired) == {"plan": "ok"}
+
+    def test_empty_string_returns_none(self) -> None:
+        assert _repair_truncated_json("") is None
+
+    def test_total_garbage_returns_none(self) -> None:
+        assert _repair_truncated_json("hello world no json here at all") is None
+
+
+# ── _parse_json tests ─────────────────────────────────────────────────
+
+
+class TestParseJson:
+    def test_plain_json(self) -> None:
+        data = LatentReasoner._parse_json('{"plan": "x"}')
+        assert data == {"plan": "x"}
+
+    def test_json_in_markdown_fences(self) -> None:
+        text = '```json\n{"plan": "y"}\n```'
+        data = LatentReasoner._parse_json(text)
+        assert data["plan"] == "y"
+
+    def test_json_fences_no_language_tag(self) -> None:
+        text = '```\n{"plan": "z"}\n```'
+        data = LatentReasoner._parse_json(text)
+        assert data["plan"] == "z"
+
+    def test_json_embedded_in_prose(self) -> None:
+        text = 'Here is my plan:\n{"plan": "embedded"}\nDone.'
+        data = LatentReasoner._parse_json(text)
+        assert data["plan"] == "embedded"
+
+    def test_truncated_json_repaired(self) -> None:
+        text = '{"plan": "trunc'
+        data = LatentReasoner._parse_json(text)
+        assert data["plan"] == "trunc"
+
+    def test_empty_raises(self) -> None:
+        with pytest.raises(ValueError, match="empty response"):
+            LatentReasoner._parse_json("")
+
+    def test_non_dict_json_raises(self) -> None:
+        with pytest.raises(ValueError):
+            LatentReasoner._parse_json('["not", "a", "dict"]')
+
+
+# ── Latent model override test ────────────────────────────────────────
+
+
+class TestLatentModelOverride:
+    @pytest.mark.asyncio
+    async def test_uses_latent_model_when_set(self) -> None:
+        provider = _make_provider()
+        config = _default_config(latent_model="cheap-model")
+        reasoner = LatentReasoner(provider, "expensive-model", config)
+
+        await reasoner.initialize(_sample_messages())
+
+        call_kwargs = provider.chat.call_args.kwargs
+        assert call_kwargs["model"] == "cheap-model"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_main_model(self) -> None:
+        provider = _make_provider()
+        config = _default_config(latent_model=None)
+        reasoner = LatentReasoner(provider, "main-model", config)
+
+        await reasoner.initialize(_sample_messages())
+
+        call_kwargs = provider.chat.call_args.kwargs
+        assert call_kwargs["model"] == "main-model"
+
+
+# ── Metrics tests ─────────────────────────────────────────────────────
+
+
+class TestLatentMetrics:
+    def test_initial_metrics_are_zero(self) -> None:
+        m = LatentMetrics()
+        assert m.total_passes == 0
+        assert m.total_latent_tokens == 0
+        assert m.converged_early == 0
+        assert m.condensation_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_refine_increments_total_passes(self) -> None:
+        provider = _make_provider({"plan": "p", "key_observations": [], "uncertainties": []})
+        reasoner = LatentReasoner(provider, "m", _default_config())
+        state = LatentState(plan="p")
+
+        await reasoner.refine(state, _sample_messages())
+        await reasoner.refine(state, _sample_messages())
+
+        assert reasoner.metrics.total_passes == 2
+
+    @pytest.mark.asyncio
+    async def test_incorporate_increments_condensation_calls(self) -> None:
+        provider = _make_provider()
+        reasoner = LatentReasoner(provider, "m", _default_config())
+        state = LatentState(plan="p")
+
+        await reasoner.incorporate_observations(state, [("exec", "output")])
+
+        assert reasoner.metrics.condensation_calls == 1
+
+
+# ── Retry logic tests ────────────────────────────────────────────────
+
+
+class TestRetryLogic:
+    @pytest.mark.asyncio
+    async def test_retries_on_connection_error(self) -> None:
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            side_effect=[ConnectionError("network down"), _make_response({"plan": "recovered"})]
+        )
+        reasoner = LatentReasoner(provider, "m", _default_config())
+
+        state = await reasoner.initialize(_sample_messages())
+
+        assert state.plan == "recovered"
+        assert provider.chat.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_falls_back_after_two_transient_failures(self) -> None:
+        provider = AsyncMock()
+        provider.chat = AsyncMock(side_effect=ConnectionError("persistent failure"))
+        reasoner = LatentReasoner(provider, "m", _default_config())
+        fallback = LatentState(plan="fallback plan")
+
+        state = await reasoner.refine(fallback, _sample_messages())
+
+        assert state.plan == "fallback plan"
+        assert provider.chat.await_count == 2
+
+
+# ── Shared orchestration tests ────────────────────────────────────────
+
+
+class TestRunLatentPasses:
+    @pytest.mark.asyncio
+    async def test_noop_when_disabled(self) -> None:
+        messages = _sample_messages()
+        state, action_msgs = await run_latent_passes(None, None, None, messages, 1)
+        assert state is None
+        assert action_msgs is messages  # identity, not copy
+
+    @pytest.mark.asyncio
+    async def test_skips_during_warmup(self) -> None:
+        provider = _make_provider({"plan": "should not change"})
+        config = _default_config(warmup_threshold=3, max_latent_passes=2)
+        reasoner = LatentReasoner(provider, "m", config)
+        initial_state = LatentState(plan="original")
+
+        # iteration=2 is within warmup (threshold=3), so should not refine
+        state, action_msgs = await run_latent_passes(
+            reasoner, initial_state, config, _sample_messages(), iteration=2,
+        )
+
+        assert state.plan == "original"  # unchanged — no refinement
+        # But inject_state should still work
+        assert len(action_msgs) == 3  # original 2 + injected state
+
+    @pytest.mark.asyncio
+    async def test_runs_passes_after_warmup(self) -> None:
+        provider = _make_provider({"plan": "new plan", "key_observations": [], "uncertainties": []})
+        config = _default_config(warmup_threshold=0, max_latent_passes=2)
+        reasoner = LatentReasoner(provider, "m", config)
+        initial_state = LatentState(plan="old plan")
+
+        state, _ = await run_latent_passes(
+            reasoner, initial_state, config, _sample_messages(), iteration=1,
+        )
+
+        assert state.plan == "new plan"
+
+    @pytest.mark.asyncio
+    async def test_early_exit_on_convergence(self) -> None:
+        """When plan doesn't change, inner loop should break early."""
+        provider = _make_provider({"plan": "stable", "key_observations": ["o"], "uncertainties": []})
+        config = _default_config(max_latent_passes=5)
+        reasoner = LatentReasoner(provider, "m", config)
+        # Start with the same plan — first pass returns "stable", matches input
+        initial_state = LatentState(plan="stable")
+
+        state, _ = await run_latent_passes(
+            reasoner, initial_state, config, _sample_messages(), iteration=1,
+        )
+
+        # Only 1 pass should have run (converged immediately)
+        assert reasoner.metrics.total_passes == 1
+        assert reasoner.metrics.converged_early == 1
+
+
+class TestIncorporateToolResults:
+    @pytest.mark.asyncio
+    async def test_noop_when_disabled(self) -> None:
+        state = await incorporate_tool_results(None, None, None, [], 1)
+        assert state is None
+
+    @pytest.mark.asyncio
+    async def test_updates_state_and_iteration(self) -> None:
+        provider = _make_provider({"plan": "updated", "key_observations": ["new"], "uncertainties": []})
+        config = _default_config()
+        reasoner = LatentReasoner(provider, "m", config)
+        initial = LatentState(plan="old", iteration=0)
+
+        result = await incorporate_tool_results(
+            reasoner, initial, config, [("exec", "output")], iteration=3,
+        )
+
+        assert result.plan == "updated"
+        assert result.iteration == 3
+
+    @pytest.mark.asyncio
+    async def test_skipped_when_condense_disabled(self) -> None:
+        config = _default_config(condense_tool_results=False)
+        reasoner = LatentReasoner(AsyncMock(), "m", config)
+        initial = LatentState(plan="unchanged")
+
+        result = await incorporate_tool_results(
+            reasoner, initial, config, [("exec", "output")], iteration=1,
+        )
+
+        assert result.plan == "unchanged"
+
+
+# ── Per-tool truncation tests ─────────────────────────────────────────
+
+
+class TestTruncateToolResults:
+    def test_per_tool_limits_applied(self) -> None:
+        results = [("web_search", "x" * 2000)]  # web_search limit is 800
+        text = LatentReasoner._truncate_tool_results(results)
+        assert "x" * 800 in text
+        assert "x" * 801 not in text
+
+    def test_total_budget_enforced(self) -> None:
+        # 4 tools each with 2000-char results: only first ~3 should get content
+        results = [("exec", "a" * 2000), ("read_file", "b" * 2000), ("exec", "c" * 2000), ("exec", "d" * 2000)]
+        text = LatentReasoner._truncate_tool_results(results)
+        assert "budget exhausted" in text
+
+    def test_default_limit_for_unknown_tool(self) -> None:
+        results = [("custom_tool", "y" * 3000)]
+        text = LatentReasoner._truncate_tool_results(results)
+        assert "y" * 1000 in text
+        assert "y" * 1001 not in text
+
+
+# ── Condensation priority tests ───────────────────────────────────────
+
+
+class TestCondenseMessagesPriority:
+    def test_tool_messages_deprioritized(self) -> None:
+        messages = [
+            {"role": "user", "content": "important question"},
+            {"role": "tool", "content": "tool output A"},
+            {"role": "tool", "content": "tool output B"},
+            {"role": "assistant", "content": "important answer"},
+        ]
+        # Budget of 2: should pick user + assistant, not tool messages
+        result = LatentReasoner._condense_messages(messages, max_messages=2)
+        assert "important question" in result
+        assert "important answer" in result
+
+    def test_tool_results_shorter_truncation(self) -> None:
+        messages = [{"role": "tool", "content": "x" * 1000}]
+        result = LatentReasoner._condense_messages(messages, max_messages=5)
+        # Tool results use 300-char limit
+        assert "x" * 300 in result
+        assert "x" * 301 not in result

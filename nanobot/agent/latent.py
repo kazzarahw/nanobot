@@ -10,7 +10,9 @@ make better-informed decisions.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -77,6 +79,17 @@ Respond with ONLY a JSON object (no markdown fences):
 
 
 @dataclass
+class LatentMetrics:
+    """Tracks cost/performance of latent-loop passes."""
+
+    total_passes: int = 0
+    total_latent_tokens: int = 0
+    converged_early: int = 0
+    initialization_tokens: int = 0
+    condensation_calls: int = 0
+
+
+@dataclass
 class LatentState:
     """Compact reasoning state carried across ReAct iterations."""
 
@@ -97,11 +110,24 @@ class LatentState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LatentState:
-        return cls(
-            plan=data.get("plan", ""),
-            key_observations=data.get("key_observations", []),
-            uncertainties=data.get("uncertainties", []),
-        )
+        plan = data.get("plan", "")
+        if not isinstance(plan, str):
+            plan = str(plan)
+        obs = data.get("key_observations", [])
+        if isinstance(obs, str):
+            obs = [obs]
+        elif not isinstance(obs, list):
+            obs = []
+        else:
+            obs = [str(o) for o in obs]
+        unc = data.get("uncertainties", [])
+        if isinstance(unc, str):
+            unc = [unc]
+        elif not isinstance(unc, list):
+            unc = []
+        else:
+            unc = [str(u) for u in unc]
+        return cls(plan=plan, key_observations=obs, uncertainties=unc)
 
     # ── Human-readable summary for injection ─────────────────────────
 
@@ -120,6 +146,87 @@ class LatentState:
 # ── Reasoner ─────────────────────────────────────────────────────────────
 
 
+# Per-tool truncation limits.  Tools not listed here use _DEFAULT_TOOL_TRUNCATION.
+_TOOL_TRUNCATION: dict[str, int] = {
+    "exec": 2000,
+    "read_file": 2000,
+    "edit_file": 1500,
+    "web_fetch": 1200,
+    "web_search": 800,
+    "list_dir": 800,
+    "write_file": 500,
+}
+_DEFAULT_TOOL_TRUNCATION = 1000
+_TOTAL_TOOL_BUDGET = 6000
+
+# Transient error patterns that warrant a retry.
+_TRANSIENT_EXCEPTIONS = (
+    ConnectionError,
+    TimeoutError,
+    asyncio.TimeoutError,
+)
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """Attempt to repair JSON truncated mid-string or mid-array.
+
+    Handles common LLM failure modes:
+    - Unterminated strings  (``"plan": "do stu``)
+    - Unclosed arrays       (``"key_observations": ["a", "b``)
+    - Missing closing brace
+    Returns the repaired text, or *None* if repair was not possible.
+    """
+    if not text:
+        return None
+    # Strip trailing whitespace / partial tokens
+    text = text.rstrip()
+
+    # Close an unterminated string: odd number of unescaped quotes
+    # means the last string was never closed.
+    quote_count = 0
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            i += 2
+            continue
+        if ch == '"':
+            quote_count += 1
+        i += 1
+
+    if quote_count % 2 == 1:
+        # Last quote is open — close it
+        text += '"'
+
+    # Close unclosed brackets / braces
+    stack: list[str] = []
+    in_string = False
+    j = 0
+    while j < len(text):
+        ch = text[j]
+        if ch == "\\" and in_string and j + 1 < len(text):
+            j += 2
+            continue
+        if ch == '"':
+            in_string = not in_string
+        elif not in_string:
+            if ch in ("{", "["):
+                stack.append("}" if ch == "{" else "]")
+            elif ch in ("}", "]") and stack:
+                stack.pop()
+        j += 1
+
+    # Append missing closers in reverse order
+    text += "".join(reversed(stack))
+
+    # Validate the result
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        return None
+
+
 class LatentReasoner:
     """Manages the inner latent-reasoning loop."""
 
@@ -132,6 +239,7 @@ class LatentReasoner:
         self.provider = provider
         self.model = model
         self.config = config
+        self.metrics = LatentMetrics()
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -161,6 +269,7 @@ class LatentReasoner:
         new_state = await self._call_for_state(prompt_messages, fallback=state)
         new_state.iteration = state.iteration
         new_state.refinement_count = state.refinement_count + 1
+        self.metrics.total_passes += 1
         logger.debug(
             f"Latent refinement #{new_state.refinement_count}: plan={new_state.plan!r:.80}"
         )
@@ -177,9 +286,7 @@ class LatentReasoner:
             state: Current latent state.
             tool_results: List of (tool_name, result_text) pairs.
         """
-        results_text = "\n\n".join(
-            f"### {name}\n{result[:1000]}" for name, result in tool_results
-        )
+        results_text = self._truncate_tool_results(tool_results)
         prompt = _CONDENSE_PROMPT.format(
             tool_results=results_text,
             plan=state.plan,
@@ -193,6 +300,7 @@ class LatentReasoner:
         new_state = await self._call_for_state(prompt_messages, fallback=state)
         new_state.iteration = state.iteration
         new_state.refinement_count = state.refinement_count
+        self.metrics.condensation_calls += 1
         logger.debug("Latent state updated with tool observations")
         return new_state
 
@@ -239,33 +347,110 @@ class LatentReasoner:
     ) -> LatentState:
         """Call the LLM and parse the response into a LatentState.
 
-        On any parse failure the *fallback* state is returned unchanged
-        (or an empty state if no fallback is provided).
+        Retries once on transient network errors.  On any parse failure
+        the *fallback* state is returned unchanged (or an empty state if
+        no fallback is provided).
         """
+        last_exc: Exception | None = None
+        for attempt in range(2):  # at most 1 retry
+            try:
+                latent_model = getattr(self.config, "latent_model", None) or self.model
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=None,
+                    model=latent_model,
+                    temperature=self.config.latent_temperature,
+                    max_tokens=self.config.latent_max_tokens,
+                )
+                # Track token usage
+                usage = getattr(response, "usage", None) or {}
+                tokens = usage.get("total_tokens") or usage.get("completion_tokens") or 0
+                self.metrics.total_latent_tokens += tokens
+
+                text = (response.content or "").strip()
+                data = self._parse_json(text)
+                return LatentState.from_dict(data)
+            except _TRANSIENT_EXCEPTIONS as e:
+                last_exc = e
+                if attempt == 0:
+                    logger.debug(f"Latent call transient error ({e}), retrying in 2s")
+                    await asyncio.sleep(2)
+                    continue
+                logger.warning(f"Latent call failed after retry ({e}), keeping previous state")
+                return fallback if fallback is not None else LatentState()
+            except Exception as e:
+                logger.warning(f"Latent state parse failed ({e}), keeping previous state")
+                return fallback if fallback is not None else LatentState()
+
+        # Should not be reached, but guard against it.
+        logger.warning(f"Latent call exhausted retries ({last_exc}), keeping previous state")
+        return fallback if fallback is not None else LatentState()
+
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any]:
+        """Parse JSON from LLM output, handling markdown fences and truncation."""
+        if not text:
+            raise ValueError("empty response")
+
+        # Strip optional markdown fences (```json ... ``` or ``` ... ```)
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        # First try a direct parse
         try:
-            response = await self.provider.chat(
-                messages=messages,
-                tools=None,
-                model=self.model,
-                temperature=self.config.latent_temperature,
-                max_tokens=self.config.latent_max_tokens,
-            )
-            text = (response.content or "").strip()
-            # Strip optional markdown fences
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
             data = json.loads(text)
-            return LatentState.from_dict(data)
-        except Exception as e:
-            logger.warning(f"Latent state parse failed ({e}), keeping previous state")
-            return fallback if fallback is not None else LatentState()
+            if isinstance(data, dict):
+                return data
+            raise ValueError(f"expected dict, got {type(data).__name__}")
+        except json.JSONDecodeError:
+            pass
+
+        # Try to extract JSON object from surrounding prose
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # Try to repair truncated JSON
+        repaired = _repair_truncated_json(text)
+        if repaired is not None:
+            data = json.loads(repaired)
+            if isinstance(data, dict):
+                logger.debug("Repaired truncated JSON in latent response")
+                return data
+
+        raise ValueError(f"could not parse JSON from latent response: {text[:120]}")
 
     @staticmethod
     def _condense_messages(messages: list[dict], max_messages: int = 6) -> str:
-        """Create a short textual summary of the most recent messages."""
-        recent = messages[-max_messages:]
+        """Create a short textual summary of the most recent messages.
+
+        Prioritises user and assistant messages over tool results (which
+        are already captured in the latent state via incorporate_observations).
+        """
+        # Separate priority messages from tool results
+        priority: list[dict] = []
+        tools: list[dict] = []
+        for msg in messages:
+            role = msg.get("role", "")
+            if role in ("tool",):
+                tools.append(msg)
+            else:
+                priority.append(msg)
+
+        # Take recent priority messages first, fill remaining budget with tool results
+        budget = max_messages
+        selected = priority[-budget:]
+        remaining = budget - len(selected)
+        if remaining > 0 and tools:
+            selected = tools[-remaining:] + selected
+
         lines: list[str] = []
-        for msg in recent:
+        for msg in selected:
             role = msg.get("role", "?").upper()
             content = msg.get("content", "")
             if isinstance(content, list):
@@ -273,8 +458,83 @@ class LatentReasoner:
                 content = " ".join(
                     part.get("text", "") for part in content if isinstance(part, dict)
                 )
-            # Truncate individual messages
-            if len(content) > 500:
-                content = content[:500] + "..."
+            # Truncate — use shorter limit for tool results
+            limit = 300 if msg.get("role") == "tool" else 500
+            if len(content) > limit:
+                content = content[:limit] + "..."
             lines.append(f"[{role}] {content}")
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _truncate_tool_results(tool_results: list[tuple[str, str]]) -> str:
+        """Truncate tool results using per-tool limits within a total budget."""
+        parts: list[str] = []
+        total_chars = 0
+        for name, result in tool_results:
+            limit = _TOOL_TRUNCATION.get(name, _DEFAULT_TOOL_TRUNCATION)
+            remaining_budget = max(0, _TOTAL_TOOL_BUDGET - total_chars)
+            effective_limit = min(limit, remaining_budget)
+            if effective_limit <= 0:
+                parts.append(f"### {name}\n(truncated — budget exhausted)")
+                continue
+            truncated = result[:effective_limit]
+            if len(result) > effective_limit:
+                truncated += "..."
+            parts.append(f"### {name}\n{truncated}")
+            total_chars += len(truncated)
+        return "\n\n".join(parts)
+
+
+# ── Shared orchestration ────────────────────────────────────────────────
+
+
+async def run_latent_passes(
+    reasoner: LatentReasoner | None,
+    state: LatentState | None,
+    config: LatentLoopConfig | None,
+    messages: list[dict],
+    iteration: int,
+) -> tuple[LatentState | None, list[dict]]:
+    """Run inner latent passes and return ``(updated_state, action_messages)``.
+
+    Shared by :class:`AgentLoop` and :class:`SubagentManager` so the
+    orchestration logic lives in exactly one place.
+
+    Supports early-exit: if the plan text is unchanged after a refinement
+    pass the inner loop breaks immediately.
+    """
+    if reasoner is None or state is None or config is None:
+        return state, messages
+
+    if iteration > config.warmup_threshold:
+        for _ in range(config.max_latent_passes):
+            prev_plan = state.plan
+            state = await reasoner.refine(state, messages)
+            if state.plan == prev_plan:
+                reasoner.metrics.converged_early += 1
+                logger.debug("Latent inner loop converged early (plan unchanged)")
+                break
+
+    action_messages = messages
+    if config.inject_state:
+        action_messages = reasoner.inject(state, messages)
+    return state, action_messages
+
+
+async def incorporate_tool_results(
+    reasoner: LatentReasoner | None,
+    state: LatentState | None,
+    config: LatentLoopConfig | None,
+    tool_results: list[tuple[str, str]],
+    iteration: int,
+) -> LatentState | None:
+    """Incorporate tool results into the latent state.
+
+    Shared helper matching :func:`run_latent_passes`.
+    """
+    if reasoner is None or state is None or config is None:
+        return state
+    if config.condense_tool_results:
+        state = await reasoner.incorporate_observations(state, tool_results)
+        state.iteration = iteration
+    return state
