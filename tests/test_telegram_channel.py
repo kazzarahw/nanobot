@@ -157,9 +157,7 @@ async def test_send_falls_back_to_plain_text_on_html_error():
     channel = _make_channel()
 
     # First call raises (HTML parse failure), second succeeds (plain text fallback)
-    channel._app.bot.send_message = AsyncMock(
-        side_effect=[Exception("Bad HTML"), None]
-    )
+    channel._app.bot.send_message = AsyncMock(side_effect=[Exception("Bad HTML"), None])
 
     msg = OutboundMessage(channel="telegram", chat_id="12345", content="Hello **world**")
     await channel.send(msg)

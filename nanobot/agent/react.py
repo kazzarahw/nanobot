@@ -6,6 +6,7 @@ from typing import Any
 from loguru import logger
 
 from nanobot.agent.context_window import prepare_action_messages
+from nanobot.agent.tools.repair import repair_tool_call
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.providers.base import LLMProvider
 
@@ -149,30 +150,51 @@ async def run_react_loop(
             has_errors = False
             error_summaries: list[str] = []
             for tool_call in response.tool_calls:
-                tools_used.append(tool_call.name)
-                args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                logger.info(f"{log_prefix}Tool call: {tool_call.name}({args_str[:200]})")
-                result = await tools.execute(tool_call.name, tool_call.arguments)
+                call_name = tool_call.name
+                call_args = tool_call.arguments
+                repaired_name, repaired_args, repaired, repair_note = repair_tool_call(
+                    tools.tool_names, call_name, call_args
+                )
+
+                tools_used.append(repaired_name)
+                args_str = json.dumps(repaired_args, ensure_ascii=False)
+                logger.info(f"{log_prefix}Tool call: {repaired_name}({args_str[:200]})")
+                execution_result = await tools.execute(repaired_name, repaired_args)
+                result = execution_result
+                if repaired:
+                    result = f"{repair_note}\n\n{execution_result}"
 
                 # Add tool result (with or without context builder)
                 if context_builder:
                     messages = context_builder.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, call_name, result
                     )
                 else:
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tool_call.id,
-                            "name": tool_call.name,
+                            "name": call_name,
                             "content": result,
                         }
                     )
 
-                tool_results_for_latent.append((tool_call.name, result))
-                if result.startswith("Error:"):
+                if repaired:
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                "Tool-call normalization reminder: call tools directly. "
+                                f"Use '{repaired_name}' with JSON arguments, not exec wrappers."
+                            ),
+                            "_internal": "tool_repair",
+                        }
+                    )
+
+                tool_results_for_latent.append((repaired_name, result))
+                if execution_result.startswith("Error:"):
                     has_errors = True
-                    error_summaries.append(f"{tool_call.name}: {result[:120]}")
+                    error_summaries.append(f"{repaired_name}: {execution_result[:120]}")
 
             # ── Update latent state with tool observations ──
             latent_state = await incorporate_tool_results(
@@ -185,7 +207,7 @@ async def run_react_loop(
 
             # ── Contextual reflect prompt ──
             reflect = _build_reflect_prompt(has_errors, error_summaries)
-            messages.append({"role": "user", "content": reflect, "_internal": "reflect"})
+            messages.append({"role": "system", "content": reflect, "_internal": "reflect"})
 
             # ── Error circuit breaker ──
             if enable_circuit_breaker and has_errors:
@@ -201,7 +223,7 @@ async def run_react_loop(
                         "You MUST try a completely different approach. "
                         "Do NOT repeat the same failing calls."
                     )
-                    messages.append({"role": "user", "content": intervention})
+                    messages.append({"role": "system", "content": intervention})
                     messages[-1]["_internal"] = "intervention"
                     logger.warning(
                         f"{log_prefix}Circuit breaker triggered after {consecutive_error_count} error iterations"

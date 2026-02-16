@@ -1,5 +1,6 @@
 """Base class for agent tools."""
 
+from copy import deepcopy
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -94,11 +95,17 @@ class Tool(ABC):
 
     def to_schema(self) -> dict[str, Any]:
         """Convert tool to OpenAI function schema format."""
+        parameters = deepcopy(self.parameters or {})
+        if parameters.get("type", "object") != "object":
+            parameters["type"] = "object"
+        parameters.setdefault("additionalProperties", False)
+
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": self.parameters,
+                "parameters": parameters,
+                "strict": True,
             },
         }

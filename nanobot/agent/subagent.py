@@ -223,6 +223,10 @@ If a tool call fails with "not found", check the list above and use the correct 
 
         prompt += f"""
 
+IMPORTANT: Never wrap built-in tools inside `exec`.
+Bad: exec({{"command": "list_dir /tmp"}})
+Good: list_dir({{"path": "/tmp"}})
+
 ## What You Cannot Do
 - Send messages directly to users (no message tool available)
 - Spawn other subagents

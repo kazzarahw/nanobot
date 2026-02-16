@@ -128,6 +128,10 @@ If a tool call fails with "not found", check the list above and use the correct 
 
         identity += f"""
 
+IMPORTANT: Never wrap built-in tools inside `exec`.
+Bad: exec({{"command": "list_dir /tmp"}})
+Good: list_dir({{"path": "/tmp"}})
+
 IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
