@@ -8,7 +8,7 @@ always: true
 
 ## Structure
 
-- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
+- `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships, pitfalls). Always loaded into your context.
 - `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep.
 
 ## Search Past Events
@@ -25,6 +25,7 @@ Write important facts immediately using `edit_file` or `write_file`:
 - User preferences ("I prefer dark mode")
 - Project context ("The API uses OAuth2")
 - Relationships ("Alice is the project lead")
+- Pitfalls and solutions ("`pip` failed, use `uv pip` instead")
 
 ## Auto-consolidation
 
