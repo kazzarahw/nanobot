@@ -25,7 +25,7 @@ from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ExecToolConfig, LspConfig
+    from nanobot.config.schema import ExecToolConfig, LatentLoopConfig, LspConfig
     from nanobot.cron.service import CronService
 
 
@@ -57,6 +57,7 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         lsp_config: LspConfig | None = None,
+        latent_config: LatentLoopConfig | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -72,6 +73,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.latent_config = latent_config
 
         # LSP integration
         self.lsp_manager = None
@@ -93,6 +95,7 @@ class AgentLoop:
             brave_api_key=brave_api_key,
             exec_config=self.exec_config,
             restrict_to_workspace=restrict_to_workspace,
+            latent_config=latent_config,
         )
 
         self._running = False
@@ -150,22 +153,54 @@ class AgentLoop:
         """
         Run the agent iteration loop.
 
+        When latent-looped inference is enabled, each outer iteration may
+        include inner *latent passes* — lightweight LLM calls (no tools,
+        reduced token budget) that refine a compact reasoning state before
+        the model commits to an action.
+
         Args:
             initial_messages: Starting messages for the LLM conversation.
 
         Returns:
             Tuple of (final_content, list_of_tools_used).
         """
+        from nanobot.agent.latent import LatentReasoner
+
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
 
+        # Initialize latent reasoner if enabled
+        latent: LatentReasoner | None = None
+        latent_state = None
+        if self.latent_config and self.latent_config.enabled:
+            latent = LatentReasoner(self.provider, self.model, self.latent_config)
+            latent_state = await latent.initialize(messages)
+
         while iteration < self.max_iterations:
             iteration += 1
 
+            # ── Inner loop: latent reasoning passes ──
+            if (
+                latent is not None
+                and latent_state is not None
+                and iteration > self.latent_config.warmup_threshold
+            ):
+                for _ in range(self.latent_config.max_latent_passes):
+                    latent_state = await latent.refine(latent_state, messages)
+
+            # Inject latent state into context for the action decision
+            action_messages = messages
+            if (
+                latent is not None
+                and latent_state is not None
+                and self.latent_config.inject_state
+            ):
+                action_messages = latent.inject(latent_state, messages)
+
             response = await self.provider.chat(
-                messages=messages,
+                messages=action_messages,
                 tools=self.tools.get_definitions(),
                 model=self.model,
                 temperature=self.temperature,
@@ -189,6 +224,7 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
 
+                tool_results_for_latent: list[tuple[str, str]] = []
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -197,6 +233,19 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    tool_results_for_latent.append((tool_call.name, result))
+
+                # ── Update latent state with tool observations ──
+                if (
+                    latent is not None
+                    and latent_state is not None
+                    and self.latent_config.condense_tool_results
+                ):
+                    latent_state = await latent.incorporate_observations(
+                        latent_state, tool_results_for_latent
+                    )
+                    latent_state.iteration = iteration
+
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
                 final_content = response.content

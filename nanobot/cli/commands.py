@@ -348,6 +348,7 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         lsp_config=config.tools.lsp,
+        latent_config=config.agents.defaults.latent_loop,
     )
 
     # Set cron callback (needs agent)
@@ -463,6 +464,7 @@ def agent(
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         lsp_config=config.tools.lsp,
+        latent_config=config.agents.defaults.latent_loop,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
