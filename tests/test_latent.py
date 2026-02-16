@@ -178,20 +178,20 @@ class TestLatentReasoner:
 
     @pytest.mark.asyncio
     async def test_incorporate_truncates_long_results(self) -> None:
-        """Tool results longer than 1000 chars are truncated in the prompt."""
+        """Tool results longer than per-tool limit are truncated in the prompt."""
         provider = _make_provider()
         reasoner = LatentReasoner(provider, "test-model", _default_config())
         state = LatentState(plan="p")
 
-        long_result = "x" * 2000
+        long_result = "x" * 5000
         await reasoner.incorporate_observations(state, [("exec", long_result)])
 
-        # Check that the prompt sent to the LLM has the truncated result
+        # exec has a 2000-char per-tool limit
         call_args = provider.chat.call_args
         prompt_messages = call_args.kwargs.get("messages") or call_args.args[0]
         system_content = prompt_messages[0]["content"]
-        assert "x" * 1000 in system_content
-        assert "x" * 1001 not in system_content
+        assert "x" * 2000 in system_content
+        assert "x" * 2001 not in system_content
 
     def test_inject_inserts_after_system(self) -> None:
         reasoner = LatentReasoner(AsyncMock(), "m", _default_config())

@@ -164,7 +164,11 @@ class AgentLoop:
         Returns:
             Tuple of (final_content, list_of_tools_used).
         """
-        from nanobot.agent.latent import LatentReasoner
+        from nanobot.agent.latent import (
+            LatentReasoner,
+            incorporate_tool_results,
+            run_latent_passes,
+        )
 
         messages = initial_messages
         iteration = 0
@@ -182,22 +186,9 @@ class AgentLoop:
             iteration += 1
 
             # ── Inner loop: latent reasoning passes ──
-            if (
-                latent is not None
-                and latent_state is not None
-                and iteration > self.latent_config.warmup_threshold
-            ):
-                for _ in range(self.latent_config.max_latent_passes):
-                    latent_state = await latent.refine(latent_state, messages)
-
-            # Inject latent state into context for the action decision
-            action_messages = messages
-            if (
-                latent is not None
-                and latent_state is not None
-                and self.latent_config.inject_state
-            ):
-                action_messages = latent.inject(latent_state, messages)
+            latent_state, action_messages = await run_latent_passes(
+                latent, latent_state, self.latent_config, messages, iteration,
+            )
 
             response = await self.provider.chat(
                 messages=action_messages,
@@ -236,20 +227,23 @@ class AgentLoop:
                     tool_results_for_latent.append((tool_call.name, result))
 
                 # ── Update latent state with tool observations ──
-                if (
-                    latent is not None
-                    and latent_state is not None
-                    and self.latent_config.condense_tool_results
-                ):
-                    latent_state = await latent.incorporate_observations(
-                        latent_state, tool_results_for_latent
-                    )
-                    latent_state.iteration = iteration
+                latent_state = await incorporate_tool_results(
+                    latent, latent_state, self.latent_config,
+                    tool_results_for_latent, iteration,
+                )
 
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
                 final_content = response.content
                 break
+
+        if latent:
+            m = latent.metrics
+            logger.info(
+                f"Latent loop stats: passes={m.total_passes}, "
+                f"tokens={m.total_latent_tokens}, converged_early={m.converged_early}, "
+                f"condensations={m.condensation_calls}"
+            )
 
         return final_content, tools_used
 
