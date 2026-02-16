@@ -596,24 +596,49 @@ async def run_latent_passes(
 
     Supports early-exit when the plan converges (similarity-based) or
     drifts off-topic.  Also enforces session-wide token and refinement
-    budgets, and skips passes for trivial queries.
+    budgets, with configurable complexity-gate behavior.
     """
     if reasoner is None or state is None or config is None:
         return state, messages
     if reasoner.disabled_due_to_instability:
         return state, messages
 
-    # Adaptive complexity: skip latent passes for trivial queries
+    # Adaptive complexity: mode-driven pass selection.
     complexity = LatentReasoner._estimate_complexity(messages)
-    if complexity == 0:
-        logger.debug("Latent passes skipped (trivial query, complexity=0)")
+    mode = getattr(config, "complexity_gate_mode", "soft")
+    min_passes = max(0, getattr(config, "min_latent_passes", 0))
+    max_passes = max(0, config.max_latent_passes)
+
+    # Strict mode preserves legacy behavior.
+    if mode == "strict" and complexity == 0:
+        logger.debug("Latent passes skipped (mode=strict, trivial query, complexity=0)")
         action_messages = messages
         if config.inject_state:
             action_messages = reasoner.inject(state, messages)
         return state, action_messages
 
-    # Scale max passes by complexity (0 already handled above)
-    effective_passes = min(config.max_latent_passes, max(1, complexity))
+    if mode == "off":
+        effective_passes = max_passes
+    else:
+        baseline = max(1, complexity)
+        if mode == "strict":
+            effective_passes = min(max_passes, baseline)
+        else:
+            # Soft mode: complexity influences pass count but does not force zero passes.
+            effective_passes = min(max_passes, max(min_passes, baseline))
+
+    logger.debug(
+        "Latent pass selection: "
+        f"mode={mode}, complexity={complexity}, min={min_passes}, "
+        f"max={max_passes}, effective={effective_passes}, iteration={iteration}"
+    )
+
+    if effective_passes <= 0:
+        logger.debug("Latent passes skipped (effective_passes<=0)")
+        action_messages = messages
+        if config.inject_state:
+            action_messages = reasoner.inject(state, messages)
+        return state, action_messages
 
     if iteration > config.warmup_threshold:
         for _ in range(effective_passes):
@@ -667,6 +692,11 @@ async def run_latent_passes(
                 reasoner.metrics.converged_early += 1
                 logger.debug(f"Latent inner loop converged early (similarity={similarity:.2f})")
                 break
+    else:
+        logger.debug(
+            "Latent passes skipped (warmup): "
+            f"iteration={iteration}, warmup_threshold={config.warmup_threshold}"
+        )
 
     action_messages = messages
     if config.inject_state and not reasoner.disabled_due_to_instability:

@@ -555,7 +555,11 @@ class TestRunLatentPasses:
 
         # iteration=2 is within warmup (threshold=3), so should not refine
         state, action_msgs = await run_latent_passes(
-            reasoner, initial_state, config, _sample_messages(), iteration=2,
+            reasoner,
+            initial_state,
+            config,
+            _sample_messages(),
+            iteration=2,
         )
 
         assert state.plan == "original"  # unchanged — no refinement
@@ -572,10 +576,17 @@ class TestRunLatentPasses:
         # Use a complex enough message so complexity estimation doesn't skip passes
         complex_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Write a Python script to implement a file parser and search through all the data"},
+            {
+                "role": "user",
+                "content": "Write a Python script to implement a file parser and search through all the data",
+            },
         ]
         state, _ = await run_latent_passes(
-            reasoner, initial_state, config, complex_messages, iteration=1,
+            reasoner,
+            initial_state,
+            config,
+            complex_messages,
+            iteration=1,
         )
 
         assert state.plan == "new plan"
@@ -583,7 +594,9 @@ class TestRunLatentPasses:
     @pytest.mark.asyncio
     async def test_early_exit_on_convergence(self) -> None:
         """When plan doesn't change, inner loop should break early."""
-        provider = _make_provider({"plan": "stable", "key_observations": ["o"], "uncertainties": []})
+        provider = _make_provider(
+            {"plan": "stable", "key_observations": ["o"], "uncertainties": []}
+        )
         config = _default_config(max_latent_passes=5)
         reasoner = LatentReasoner(provider, "m", config)
         # Start with the same plan — first pass returns "stable", matches input
@@ -591,10 +604,17 @@ class TestRunLatentPasses:
 
         complex_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Write a Python script to implement a file parser and search through all the data"},
+            {
+                "role": "user",
+                "content": "Write a Python script to implement a file parser and search through all the data",
+            },
         ]
         state, _ = await run_latent_passes(
-            reasoner, initial_state, config, complex_messages, iteration=1,
+            reasoner,
+            initial_state,
+            config,
+            complex_messages,
+            iteration=1,
         )
 
         # Only 1 pass should have run (converged immediately)
@@ -611,10 +631,17 @@ class TestRunLatentPasses:
 
         complex_messages = [
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "Write a Python script to implement a file parser and search through all the data"},
+            {
+                "role": "user",
+                "content": "Write a Python script to implement a file parser and search through all the data",
+            },
         ]
         state, _ = await run_latent_passes(
-            reasoner, initial_state, config, complex_messages, iteration=1,
+            reasoner,
+            initial_state,
+            config,
+            complex_messages,
+            iteration=1,
         )
 
         assert state.plan == "stable"
@@ -630,13 +657,19 @@ class TestIncorporateToolResults:
 
     @pytest.mark.asyncio
     async def test_updates_state_and_iteration(self) -> None:
-        provider = _make_provider({"plan": "updated", "key_observations": ["new"], "uncertainties": []})
+        provider = _make_provider(
+            {"plan": "updated", "key_observations": ["new"], "uncertainties": []}
+        )
         config = _default_config()
         reasoner = LatentReasoner(provider, "m", config)
         initial = LatentState(plan="old", iteration=0)
 
         result = await incorporate_tool_results(
-            reasoner, initial, config, [("exec", "output")], iteration=3,
+            reasoner,
+            initial,
+            config,
+            [("exec", "output")],
+            iteration=3,
         )
 
         assert result.plan == "updated"
@@ -649,7 +682,11 @@ class TestIncorporateToolResults:
         initial = LatentState(plan="unchanged")
 
         result = await incorporate_tool_results(
-            reasoner, initial, config, [("exec", "output")], iteration=1,
+            reasoner,
+            initial,
+            config,
+            [("exec", "output")],
+            iteration=1,
         )
 
         assert result.plan == "unchanged"
@@ -667,7 +704,12 @@ class TestTruncateToolResults:
 
     def test_total_budget_enforced(self) -> None:
         # 4 tools each with 2000-char results: only first ~3 should get content
-        results = [("exec", "a" * 2000), ("read_file", "b" * 2000), ("exec", "c" * 2000), ("exec", "d" * 2000)]
+        results = [
+            ("exec", "a" * 2000),
+            ("read_file", "b" * 2000),
+            ("exec", "c" * 2000),
+            ("exec", "d" * 2000),
+        ]
         text = LatentReasoner._truncate_tool_results(results)
         assert "budget exhausted" in text
 
@@ -773,7 +815,11 @@ class TestBudgetExhaustion:
         state = LatentState(plan="original")
 
         result_state, _ = await run_latent_passes(
-            reasoner, state, config, _sample_messages(), iteration=1,
+            reasoner,
+            state,
+            config,
+            _sample_messages(),
+            iteration=1,
         )
 
         # Plan should be unchanged since refinement was skipped
@@ -791,7 +837,11 @@ class TestBudgetExhaustion:
         state = LatentState(plan="original")
 
         result_state, _ = await run_latent_passes(
-            reasoner, state, config, _sample_messages(), iteration=1,
+            reasoner,
+            state,
+            config,
+            _sample_messages(),
+            iteration=1,
         )
 
         assert result_state.plan == "original"
@@ -799,11 +849,13 @@ class TestBudgetExhaustion:
     @pytest.mark.asyncio
     async def test_drift_reverts_plan(self) -> None:
         """When plan drift is detected, the plan should revert to previous."""
-        provider = _make_provider({
-            "plan": "Write code then schedule meeting with team",
-            "key_observations": ["obs"],
-            "uncertainties": [],
-        })
+        provider = _make_provider(
+            {
+                "plan": "Write code then schedule meeting with team",
+                "key_observations": ["obs"],
+                "uncertainties": [],
+            }
+        )
         config = _default_config(
             max_latent_passes=3,
             plan_drift_keywords=["schedule meeting"],
@@ -812,7 +864,11 @@ class TestBudgetExhaustion:
         state = LatentState(plan="Write the code")
 
         result_state, _ = await run_latent_passes(
-            reasoner, state, config, _sample_messages(), iteration=1,
+            reasoner,
+            state,
+            config,
+            _sample_messages(),
+            iteration=1,
         )
 
         # Should revert to previous plan
@@ -821,11 +877,13 @@ class TestBudgetExhaustion:
     @pytest.mark.asyncio
     async def test_similarity_convergence(self) -> None:
         """Plans with high similarity should trigger early convergence."""
-        provider = _make_provider({
-            "plan": "Write a Python script to parse files",
-            "key_observations": [],
-            "uncertainties": [],
-        })
+        provider = _make_provider(
+            {
+                "plan": "Write a Python script to parse files",
+                "key_observations": [],
+                "uncertainties": [],
+            }
+        )
         config = _default_config(
             max_latent_passes=5,
             convergence_similarity=0.85,
@@ -834,8 +892,16 @@ class TestBudgetExhaustion:
         state = LatentState(plan="Write a Python script to parse data files")
 
         await run_latent_passes(
-            reasoner, state, config,
-            [{"role": "system", "content": "sys"}, {"role": "user", "content": "Write a parser for JSON files and data transformation"}],
+            reasoner,
+            state,
+            config,
+            [
+                {"role": "system", "content": "sys"},
+                {
+                    "role": "user",
+                    "content": "Write a parser for JSON files and data transformation",
+                },
+            ],
             iteration=1,
         )
 
@@ -885,20 +951,35 @@ class TestEstimateComplexity:
         assert c <= 1
 
     def test_complex_multi_action(self) -> None:
-        messages = [{"role": "user", "content": "Write a script to create a new database, implement the migration, and deploy the service with proper configuration and search indexing"}]
+        messages = [
+            {
+                "role": "user",
+                "content": "Write a script to create a new database, implement the migration, and deploy the service with proper configuration and search indexing",
+            }
+        ]
         c = LatentReasoner._estimate_complexity(messages)
         assert c >= 2
 
     def test_single_action_moderate(self) -> None:
-        messages = [{"role": "user", "content": "Please fix the bug in the authentication module that causes login failures"}]
+        messages = [
+            {
+                "role": "user",
+                "content": "Please fix the bug in the authentication module that causes login failures",
+            }
+        ]
         c = LatentReasoner._estimate_complexity(messages)
         assert c >= 1
 
     @pytest.mark.asyncio
-    async def test_trivial_query_skips_passes(self) -> None:
-        """A trivial query (complexity=0) should skip latent passes entirely."""
+    async def test_trivial_query_runs_passes_in_soft_mode(self) -> None:
+        """Soft mode should not hard-skip latent passes for trivial queries."""
         provider = _make_provider({"plan": "new", "key_observations": [], "uncertainties": []})
-        config = _default_config(max_latent_passes=3)
+        config = _default_config(
+            complexity_gate_mode="soft",
+            min_latent_passes=2,
+            max_latent_passes=2,
+            convergence_similarity=1.1,
+        )
         reasoner = LatentReasoner(provider, "m", config)
         state = LatentState(plan="original")
 
@@ -907,12 +988,77 @@ class TestEstimateComplexity:
             {"role": "user", "content": "hi"},
         ]
         result_state, _ = await run_latent_passes(
-            reasoner, state, config, messages, iteration=1,
+            reasoner,
+            state,
+            config,
+            messages,
+            iteration=1,
         )
 
-        # No refinement calls should have been made
+        assert reasoner.metrics.total_passes == 2
+        assert result_state.plan == "new"
+
+    @pytest.mark.asyncio
+    async def test_trivial_query_skips_in_strict_mode(self) -> None:
+        provider = _make_provider({"plan": "new", "key_observations": [], "uncertainties": []})
+        config = _default_config(complexity_gate_mode="strict", max_latent_passes=3)
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="original")
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+        result_state, _ = await run_latent_passes(
+            reasoner,
+            state,
+            config,
+            messages,
+            iteration=1,
+        )
+
         assert reasoner.metrics.total_passes == 0
         assert result_state.plan == "original"
+
+    @pytest.mark.asyncio
+    async def test_off_mode_ignores_complexity_cap(self) -> None:
+        provider = _make_provider({"plan": "new", "key_observations": [], "uncertainties": []})
+        config = _default_config(
+            complexity_gate_mode="off",
+            min_latent_passes=0,
+            max_latent_passes=3,
+            convergence_similarity=1.1,
+        )
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="original")
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "What is the capital of France?"},
+        ]
+
+        await run_latent_passes(reasoner, state, config, messages, iteration=1)
+
+        assert reasoner.metrics.total_passes == 3
+
+    @pytest.mark.asyncio
+    async def test_soft_mode_min_passes_clamped_by_max(self) -> None:
+        provider = _make_provider({"plan": "new", "key_observations": [], "uncertainties": []})
+        config = _default_config(
+            complexity_gate_mode="soft",
+            min_latent_passes=5,
+            max_latent_passes=2,
+            convergence_similarity=1.1,
+        )
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="original")
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Please write tests"},
+        ]
+
+        await run_latent_passes(reasoner, state, config, messages, iteration=1)
+
+        assert reasoner.metrics.total_passes == 2
 
     def test_ignores_internal_user_prompts(self) -> None:
         messages = [
@@ -929,6 +1075,8 @@ class TestEstimateComplexity:
 class TestNewLatentLoopConfigFields:
     def test_new_defaults(self) -> None:
         config = LatentLoopConfig()
+        assert config.complexity_gate_mode == "soft"
+        assert config.min_latent_passes == 2
         assert config.max_total_latent_tokens == 50_000
         assert config.max_total_refinements == 30
         assert config.convergence_similarity == 0.85
@@ -957,12 +1105,15 @@ class TestRegistryEnhancedErrors:
             @property
             def name(self) -> str:
                 return "fake_tool"
+
             @property
             def description(self) -> str:
                 return "A fake tool"
+
             @property
             def parameters(self) -> dict:
                 return {"type": "object", "properties": {}}
+
             async def execute(self, **kwargs) -> str:
                 return "ok"
 
@@ -981,12 +1132,15 @@ class TestRegistryEnhancedErrors:
             @property
             def name(self) -> str:
                 return "real_tool"
+
             @property
             def description(self) -> str:
                 return "A real tool"
+
             @property
             def parameters(self) -> dict:
                 return {"type": "object", "properties": {}}
+
             async def execute(self, **kwargs) -> str:
                 return "ok"
 

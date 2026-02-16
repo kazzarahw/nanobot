@@ -1,6 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings
@@ -192,6 +193,8 @@ class LatentLoopConfig(BaseModel):
     condense_tool_results: bool = True
     inject_state: bool = True
     warmup_threshold: int = 0
+    complexity_gate_mode: Literal["soft", "strict", "off"] = "soft"
+    min_latent_passes: int = Field(default=2, ge=0)
     max_total_latent_tokens: int = 50_000  # Session-wide token budget for latent passes
     max_total_refinements: int = 30  # Total refinement cap across all iterations
     convergence_similarity: float = 0.85  # Fuzzy match threshold for plan convergence
