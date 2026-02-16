@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -15,6 +15,9 @@ from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
+
+if TYPE_CHECKING:
+    from nanobot.config.schema import LatentLoopConfig
 
 
 class SubagentManager:
@@ -37,6 +40,7 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        latent_config: "LatentLoopConfig | None" = None,
     ):
         from nanobot.config.schema import ExecToolConfig
 
@@ -49,6 +53,7 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.latent_config = latent_config
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def spawn(
@@ -123,6 +128,15 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
+            # Initialize latent reasoner if enabled
+            from nanobot.agent.latent import LatentReasoner
+
+            latent: LatentReasoner | None = None
+            latent_state = None
+            if self.latent_config and self.latent_config.enabled:
+                latent = LatentReasoner(self.provider, self.model, self.latent_config)
+                latent_state = await latent.initialize(messages)
+
             # Run agent loop (limited iterations)
             max_iterations = 15
             iteration = 0
@@ -131,8 +145,26 @@ class SubagentManager:
             while iteration < max_iterations:
                 iteration += 1
 
+                # ── Inner loop: latent reasoning passes ──
+                if (
+                    latent is not None
+                    and latent_state is not None
+                    and iteration > self.latent_config.warmup_threshold
+                ):
+                    for _ in range(self.latent_config.max_latent_passes):
+                        latent_state = await latent.refine(latent_state, messages)
+
+                # Inject latent state for the action decision
+                action_messages = messages
+                if (
+                    latent is not None
+                    and latent_state is not None
+                    and self.latent_config.inject_state
+                ):
+                    action_messages = latent.inject(latent_state, messages)
+
                 response = await self.provider.chat(
-                    messages=messages,
+                    messages=action_messages,
                     tools=tools.get_definitions(),
                     model=self.model,
                     temperature=self.temperature,
@@ -161,6 +193,7 @@ class SubagentManager:
                     )
 
                     # Execute tools
+                    tool_results_for_latent: list[tuple[str, str]] = []
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments)
                         logger.debug(
@@ -175,6 +208,18 @@ class SubagentManager:
                                 "content": result,
                             }
                         )
+                        tool_results_for_latent.append((tool_call.name, result))
+
+                    # ── Update latent state with tool observations ──
+                    if (
+                        latent is not None
+                        and latent_state is not None
+                        and self.latent_config.condense_tool_results
+                    ):
+                        latent_state = await latent.incorporate_observations(
+                            latent_state, tool_results_for_latent
+                        )
+                        latent_state.iteration = iteration
                 else:
                     final_result = response.content
                     break

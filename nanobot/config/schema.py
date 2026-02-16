@@ -176,6 +176,23 @@ class ChannelsConfig(BaseModel):
     qq: QQConfig = Field(default_factory=QQConfig)
 
 
+class LatentLoopConfig(BaseModel):
+    """Latent-looped inference configuration.
+
+    When enabled, the agent performs inner reasoning passes before each
+    action decision in the ReAct loop.  This gives the model more
+    compute-per-step while keeping the context window manageable.
+    """
+
+    enabled: bool = False
+    max_latent_passes: int = 3
+    latent_max_tokens: int = 1024
+    latent_temperature: float = 0.3
+    condense_tool_results: bool = True
+    inject_state: bool = True
+    warmup_threshold: int = 0
+
+
 class AgentDefaults(BaseModel):
     """Default agent configuration."""
 
@@ -185,6 +202,7 @@ class AgentDefaults(BaseModel):
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
+    latent_loop: LatentLoopConfig = Field(default_factory=LatentLoopConfig)
 
 
 class AgentsConfig(BaseModel):
