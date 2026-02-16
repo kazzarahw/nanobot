@@ -202,13 +202,25 @@ class LatentReasoner:
         The state is inserted as a second system message right after the
         first system prompt so the model can condition on it without
         polluting the conversation history.
+
+        The original *state* and *messages* are never mutated.
         """
+        # Work on a shallow copy of observations so we never mutate the caller's state
+        observations = list(state.key_observations)
         summary = state.summary()
+
         # Truncate if too long (drop oldest observations first)
-        if len(summary) > _MAX_STATE_CHARS:
-            while state.key_observations and len(summary) > _MAX_STATE_CHARS:
-                state.key_observations.pop(0)
-                summary = state.summary()
+        while observations and len(summary) > _MAX_STATE_CHARS:
+            observations.pop(0)
+            # Rebuild summary with the trimmed list
+            trimmed = LatentState(
+                plan=state.plan,
+                key_observations=observations,
+                uncertainties=state.uncertainties,
+                iteration=state.iteration,
+                refinement_count=state.refinement_count,
+            )
+            summary = trimmed.summary()
 
         state_msg: dict[str, Any] = {"role": "system", "content": summary}
 

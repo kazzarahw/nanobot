@@ -234,6 +234,19 @@ class TestLatentReasoner:
         injected_content = result[1]["content"]
         assert len(injected_content) <= 5000  # well under any reasonable limit
 
+    def test_inject_does_not_mutate_state(self) -> None:
+        """inject() must never modify the caller's LatentState object."""
+        reasoner = LatentReasoner(AsyncMock(), "m", _default_config())
+        original_obs = ["o" * 500 for _ in range(20)]
+        state = LatentState(plan="p", key_observations=list(original_obs))
+        messages = _sample_messages()
+
+        reasoner.inject(state, messages)
+
+        # The original state's observations must be untouched
+        assert len(state.key_observations) == len(original_obs)
+        assert state.key_observations == original_obs
+
     @pytest.mark.asyncio
     async def test_config_temperature_and_tokens(self) -> None:
         """Latent calls use the configured temperature and max_tokens."""
