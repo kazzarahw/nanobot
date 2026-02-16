@@ -1,5 +1,6 @@
 """Tool registry for dynamic tool management."""
 
+from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
@@ -20,17 +21,9 @@ class ToolRegistry:
         """Register a tool."""
         self._tools[tool.name] = tool
 
-    def unregister(self, name: str) -> None:
-        """Unregister a tool by name."""
-        self._tools.pop(name, None)
-
     def get(self, name: str) -> Tool | None:
         """Get a tool by name."""
         return self._tools.get(name)
-
-    def has(self, name: str) -> bool:
-        """Check if a tool is registered."""
-        return name in self._tools
 
     def get_definitions(self) -> list[dict[str, Any]]:
         """Get all tool definitions in OpenAI format."""
@@ -74,10 +67,6 @@ class ToolRegistry:
         except Exception as e:
             return f"Error executing {name}: {str(e)}"
 
-    def get_error_stats(self) -> dict[str, int]:
-        """Get counts of invalid tool attempts by name."""
-        return dict(self._invalid_tool_attempts)
-
     @property
     def tool_names(self) -> list[str]:
         """Get list of registered tool names."""
@@ -86,5 +75,41 @@ class ToolRegistry:
     def __len__(self) -> int:
         return len(self._tools)
 
-    def __contains__(self, name: str) -> bool:
-        return name in self._tools
+
+def register_core_tools(
+    registry: ToolRegistry,
+    workspace: Path,
+    restrict_to_workspace: bool = False,
+    brave_api_key: str | None = None,
+    exec_timeout: int = 120000,
+    lsp_manager: Any = None,
+) -> None:
+    """
+    Register the 7 core tools used by both agents and subagents.
+
+    Args:
+        registry: The tool registry to populate.
+        workspace: The workspace path.
+        restrict_to_workspace: Whether to restrict file ops to workspace.
+        brave_api_key: Optional API key for web search.
+        exec_timeout: Timeout for shell commands (ms).
+        lsp_manager: Optional LSP manager for file tools.
+    """
+    from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+    from nanobot.agent.tools.shell import ExecTool
+    from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+
+    allowed_dir = workspace if restrict_to_workspace else None
+    registry.register(ReadFileTool(allowed_dir=allowed_dir, lsp_manager=lsp_manager))
+    registry.register(WriteFileTool(allowed_dir=allowed_dir, lsp_manager=lsp_manager))
+    registry.register(EditFileTool(allowed_dir=allowed_dir, lsp_manager=lsp_manager))
+    registry.register(ListDirTool(allowed_dir=allowed_dir))
+    registry.register(
+        ExecTool(
+            working_dir=str(workspace),
+            timeout=exec_timeout,
+            restrict_to_workspace=restrict_to_workspace,
+        )
+    )
+    registry.register(WebSearchTool(api_key=brave_api_key))
+    registry.register(WebFetchTool())

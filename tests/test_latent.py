@@ -943,12 +943,3 @@ class TestRegistryEnhancedErrors:
         result = await registry.execute("bad_tool", {})
         assert "STOP" in result
         assert "3 times" in result
-
-    def test_get_error_stats(self) -> None:
-        from nanobot.agent.tools.registry import ToolRegistry
-
-        registry = ToolRegistry()
-        # Trigger some errors synchronously by accessing internal state
-        registry._invalid_tool_attempts["bad_tool"] = 5
-        stats = registry.get_error_stats()
-        assert stats == {"bad_tool": 5}

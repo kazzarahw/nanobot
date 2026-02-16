@@ -12,13 +12,11 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.react import run_react_loop
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.shell import ExecTool
+from nanobot.agent.tools.registry import ToolRegistry, register_core_tools
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -108,25 +106,15 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
-        # File tools (restrict to workspace if configured)
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
-        self.tools.register(ReadFileTool(allowed_dir=allowed_dir, lsp_manager=self.lsp_manager))
-        self.tools.register(WriteFileTool(allowed_dir=allowed_dir, lsp_manager=self.lsp_manager))
-        self.tools.register(EditFileTool(allowed_dir=allowed_dir, lsp_manager=self.lsp_manager))
-        self.tools.register(ListDirTool(allowed_dir=allowed_dir))
-
-        # Shell tool
-        self.tools.register(
-            ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-            )
+        # Register core tools (filesystem, shell, web)
+        register_core_tools(
+            self.tools,
+            workspace=self.workspace,
+            restrict_to_workspace=self.restrict_to_workspace,
+            brave_api_key=self.brave_api_key,
+            exec_timeout=self.exec_config.timeout,
+            lsp_manager=self.lsp_manager,
         )
-
-        # Web tools
-        self.tools.register(WebSearchTool(api_key=self.brave_api_key))
-        self.tools.register(WebFetchTool())
 
         # Message tool
         message_tool = MessageTool(send_callback=self.bus.publish_outbound)
@@ -154,28 +142,9 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    def _build_reflect_prompt(self, has_errors: bool, error_summaries: list[str]) -> str:
-        """Build a contextual reflect prompt based on tool execution results."""
-        if has_errors:
-            summary = "; ".join(error_summaries[:3])
-            return (
-                f"Tool calls failed: {summary}. "
-                "Fix errors or try a different approach. "
-                "Do NOT repeat the same failing call."
-            )
-        return (
-            "Tool calls succeeded. "
-            "Provide your final response if done, or proceed with the next action."
-        )
-
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
-
-        When latent-looped inference is enabled, each outer iteration may
-        include inner *latent passes* — lightweight LLM calls (no tools,
-        reduced token budget) that refine a compact reasoning state before
-        the model commits to an action.
 
         Args:
             initial_messages: Starting messages for the LLM conversation.
@@ -183,119 +152,19 @@ class AgentLoop:
         Returns:
             Tuple of (final_content, list_of_tools_used).
         """
-        from nanobot.agent.latent import (
-            LatentReasoner,
-            incorporate_tool_results,
-            run_latent_passes,
+        return await run_react_loop(
+            provider=self.provider,
+            model=self.model,
+            tools=self.tools,
+            initial_messages=initial_messages,
+            max_iterations=self.max_iterations,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            latent_config=self.latent_config,
+            enable_circuit_breaker=True,
+            log_prefix="",
+            context_builder=self.context,
         )
-
-        messages = initial_messages
-        iteration = 0
-        final_content = None
-        tools_used: list[str] = []
-        consecutive_error_count = 0
-        recent_errors: list[str] = []
-
-        # Initialize latent reasoner if enabled
-        latent: LatentReasoner | None = None
-        latent_state = None
-        if self.latent_config and self.latent_config.enabled:
-            latent = LatentReasoner(self.provider, self.model, self.latent_config)
-            latent_state = await latent.initialize(messages)
-
-        while iteration < self.max_iterations:
-            iteration += 1
-
-            # ── Inner loop: latent reasoning passes ──
-            latent_state, action_messages = await run_latent_passes(
-                latent, latent_state, self.latent_config, messages, iteration,
-            )
-
-            response = await self.provider.chat(
-                messages=action_messages,
-                tools=self.tools.get_definitions(),
-                model=self.model,
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-            )
-
-            if response.has_tool_calls:
-                tool_call_dicts = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments)
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
-                )
-
-                tool_results_for_latent: list[tuple[str, str]] = []
-                has_errors = False
-                error_summaries: list[str] = []
-                for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
-                    messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                    tool_results_for_latent.append((tool_call.name, result))
-                    if result.startswith("Error:"):
-                        has_errors = True
-                        error_summaries.append(f"{tool_call.name}: {result[:120]}")
-
-                # ── Update latent state with tool observations ──
-                latent_state = await incorporate_tool_results(
-                    latent, latent_state, self.latent_config,
-                    tool_results_for_latent, iteration,
-                )
-
-                # ── Contextual reflect prompt ──
-                reflect = self._build_reflect_prompt(has_errors, error_summaries)
-                messages.append({"role": "user", "content": reflect})
-
-                # ── Error circuit breaker ──
-                if has_errors:
-                    consecutive_error_count += 1
-                    recent_errors.extend(error_summaries)
-                    if consecutive_error_count >= 3:
-                        valid_tools = ", ".join(sorted(self.tools.tool_names))
-                        intervention = (
-                            f"STOP. You have had {consecutive_error_count} consecutive "
-                            f"iterations with errors. Recent errors:\n"
-                            + "\n".join(f"- {e}" for e in recent_errors[-6:])
-                            + f"\n\nAvailable tools: {valid_tools}\n"
-                            "You MUST try a completely different approach. "
-                            "Do NOT repeat the same failing calls."
-                        )
-                        messages.append({"role": "user", "content": intervention})
-                        logger.warning(f"Circuit breaker triggered after {consecutive_error_count} error iterations")
-                        consecutive_error_count = 0
-                        recent_errors.clear()
-                else:
-                    consecutive_error_count = 0
-                    recent_errors.clear()
-            else:
-                final_content = response.content
-                break
-
-        if latent:
-            m = latent.metrics
-            logger.info(
-                f"Latent loop stats: passes={m.total_passes}, "
-                f"tokens={m.total_latent_tokens}, converged_early={m.converged_early}, "
-                f"condensations={m.condensation_calls}"
-            )
-
-        return final_content, tools_used
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""

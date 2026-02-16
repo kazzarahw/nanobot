@@ -8,10 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
-from nanobot.agent.tools.registry import ToolRegistry
-from nanobot.agent.tools.shell import ExecTool
-from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.agent.react import run_react_loop
+from nanobot.agent.tools.registry import ToolRegistry, register_core_tools
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -106,20 +104,13 @@ class SubagentManager:
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
-            tools.register(ReadFileTool(allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(allowed_dir=allowed_dir))
-            tools.register(EditFileTool(allowed_dir=allowed_dir))
-            tools.register(ListDirTool(allowed_dir=allowed_dir))
-            tools.register(
-                ExecTool(
-                    working_dir=str(self.workspace),
-                    timeout=self.exec_config.timeout,
-                    restrict_to_workspace=self.restrict_to_workspace,
-                )
+            register_core_tools(
+                tools,
+                workspace=self.workspace,
+                restrict_to_workspace=self.restrict_to_workspace,
+                brave_api_key=self.brave_api_key,
+                exec_timeout=self.exec_config.timeout,
             )
-            tools.register(WebSearchTool(api_key=self.brave_api_key))
-            tools.register(WebFetchTool())
 
             # Build messages with subagent-specific prompt
             system_prompt = self._build_subagent_prompt(task, tool_names=tools.tool_names)
@@ -128,107 +119,20 @@ class SubagentManager:
                 {"role": "user", "content": task},
             ]
 
-            # Initialize latent reasoner if enabled
-            from nanobot.agent.latent import (
-                LatentReasoner,
-                incorporate_tool_results,
-                run_latent_passes,
+            # Run ReAct loop (limited iterations, no circuit breaker for subagents)
+            final_result, _ = await run_react_loop(
+                provider=self.provider,
+                model=self.model,
+                tools=tools,
+                initial_messages=messages,
+                max_iterations=15,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                latent_config=self.latent_config,
+                enable_circuit_breaker=False,
+                log_prefix=f"Subagent [{task_id}] ",
+                context_builder=None,
             )
-
-            latent: LatentReasoner | None = None
-            latent_state = None
-            if self.latent_config and self.latent_config.enabled:
-                latent = LatentReasoner(self.provider, self.model, self.latent_config)
-                latent_state = await latent.initialize(messages)
-
-            # Run agent loop (limited iterations)
-            max_iterations = 15
-            iteration = 0
-            final_result: str | None = None
-
-            while iteration < max_iterations:
-                iteration += 1
-
-                # ── Inner loop: latent reasoning passes ──
-                latent_state, action_messages = await run_latent_passes(
-                    latent, latent_state, self.latent_config, messages, iteration,
-                )
-
-                response = await self.provider.chat(
-                    messages=action_messages,
-                    tools=tools.get_definitions(),
-                    model=self.model,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
-
-                if response.has_tool_calls:
-                    # Add assistant message with tool calls
-                    tool_call_dicts = [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": json.dumps(tc.arguments),
-                            },
-                        }
-                        for tc in response.tool_calls
-                    ]
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": response.content or "",
-                            "tool_calls": tool_call_dicts,
-                        }
-                    )
-
-                    # Execute tools
-                    tool_results_for_latent: list[tuple[str, str]] = []
-                    has_errors = False
-                    error_summaries: list[str] = []
-                    for tool_call in response.tool_calls:
-                        args_str = json.dumps(tool_call.arguments)
-                        logger.debug(
-                            f"Subagent [{task_id}] executing: {tool_call.name} with arguments: {args_str}"
-                        )
-                        result = await tools.execute(tool_call.name, tool_call.arguments)
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_call.name,
-                                "content": result,
-                            }
-                        )
-                        tool_results_for_latent.append((tool_call.name, result))
-                        if result.startswith("Error:"):
-                            has_errors = True
-                            error_summaries.append(f"{tool_call.name}: {result[:120]}")
-
-                    # ── Update latent state with tool observations ──
-                    latent_state = await incorporate_tool_results(
-                        latent, latent_state, self.latent_config,
-                        tool_results_for_latent, iteration,
-                    )
-
-                    # ── Contextual reflect prompt ──
-                    if has_errors:
-                        summary = "; ".join(error_summaries[:3])
-                        reflect = (
-                            f"Tool calls failed: {summary}. "
-                            "Fix errors or try a different approach. "
-                            "Do NOT repeat the same failing call."
-                        )
-                    else:
-                        reflect = (
-                            "Tool calls succeeded. "
-                            "Provide your final response if done, or proceed with the next action."
-                        )
-                    messages.append({"role": "user", "content": reflect})
-                else:
-                    final_result = response.content
-                    break
 
             if final_result is None:
                 final_result = "Task completed but no final response was generated."

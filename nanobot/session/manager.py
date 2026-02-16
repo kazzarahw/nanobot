@@ -144,33 +144,3 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
-
-    def list_sessions(self) -> list[dict[str, Any]]:
-        """
-        List all sessions.
-
-        Returns:
-            List of session info dicts.
-        """
-        sessions = []
-
-        for path in self.sessions_dir.glob("*.jsonl"):
-            try:
-                # Read just the metadata line
-                with open(path) as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
-                        if data.get("_type") == "metadata":
-                            sessions.append(
-                                {
-                                    "key": path.stem.replace("_", ":"),
-                                    "created_at": data.get("created_at"),
-                                    "updated_at": data.get("updated_at"),
-                                    "path": str(path),
-                                }
-                            )
-            except Exception:
-                continue
-
-        return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
