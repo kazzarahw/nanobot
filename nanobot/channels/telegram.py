@@ -258,9 +258,7 @@ class TelegramChannel(BaseChannel):
                 html_content = _markdown_to_telegram_html(chunk)
                 # If HTML conversion expanded beyond the limit, split again.
                 for part in _split_text(html_content, _TELEGRAM_MAX_LENGTH):
-                    await self._app.bot.send_message(
-                        chat_id=chat_id, text=part, parse_mode="HTML"
-                    )
+                    await self._app.bot.send_message(chat_id=chat_id, text=part, parse_mode="HTML")
             except Exception as e:
                 # Fallback to plain text if HTML parsing fails
                 logger.warning(f"HTML parse failed, falling back to plain text: {e}")

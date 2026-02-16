@@ -38,5 +38,3 @@ def safe_filename(name: str) -> str:
     for char in unsafe:
         name = name.replace(char, "_")
     return name.strip()
-
-

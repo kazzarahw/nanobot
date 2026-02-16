@@ -386,9 +386,21 @@ class LatentReasoner:
 
         # Check for action-oriented keywords
         action_keywords = [
-            "write", "create", "build", "implement", "fix", "debug",
-            "refactor", "deploy", "configure", "analyze", "search",
-            "edit", "modify", "update", "install",
+            "write",
+            "create",
+            "build",
+            "implement",
+            "fix",
+            "debug",
+            "refactor",
+            "deploy",
+            "configure",
+            "analyze",
+            "search",
+            "edit",
+            "modify",
+            "update",
+            "install",
         ]
         text_lower = user_text.lower()
         action_count = sum(1 for kw in action_keywords if kw in text_lower)
@@ -653,9 +665,7 @@ async def run_latent_passes(
             similarity = LatentReasoner._plan_similarity(prev_plan, state.plan)
             if similarity >= config.convergence_similarity:
                 reasoner.metrics.converged_early += 1
-                logger.debug(
-                    f"Latent inner loop converged early (similarity={similarity:.2f})"
-                )
+                logger.debug(f"Latent inner loop converged early (similarity={similarity:.2f})")
                 break
 
     action_messages = messages

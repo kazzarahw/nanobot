@@ -54,10 +54,7 @@ class ToolRegistry:
                     f"You have attempted it {attempts} times. "
                     f"Use ONLY these tools: {valid_names}"
                 )
-            return (
-                f"Error: Tool '{name}' not found. "
-                f"Available tools: {valid_names}"
-            )
+            return f"Error: Tool '{name}' not found. Available tools: {valid_names}"
 
         try:
             errors = tool.validate_params(params)
@@ -95,7 +92,12 @@ def register_core_tools(
         exec_timeout: Timeout for shell commands (ms).
         lsp_manager: Optional LSP manager for file tools.
     """
-    from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+    from nanobot.agent.tools.filesystem import (
+        EditFileTool,
+        ListDirTool,
+        ReadFileTool,
+        WriteFileTool,
+    )
     from nanobot.agent.tools.shell import ExecTool
     from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 

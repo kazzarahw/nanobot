@@ -32,7 +32,9 @@ def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
             home_root = Path("/home")
             if home_root.exists():
                 existing = [d.name for d in home_root.iterdir() if d.is_dir()]
-                suggestion = f" Existing home directories: {', '.join(sorted(existing))}" if existing else ""
+                suggestion = (
+                    f" Existing home directories: {', '.join(sorted(existing))}" if existing else ""
+                )
                 raise FileNotFoundError(
                     f"Home directory '{user_dir}' does not exist.{suggestion} "
                     f"IMPORTANT: Use exact paths. Do NOT guess usernames."

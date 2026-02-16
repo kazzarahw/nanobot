@@ -92,7 +92,11 @@ async def run_react_loop(
 
         # ── Inner loop: latent reasoning passes ──
         latent_state, action_messages = await run_latent_passes(
-            latent, latent_state, latent_config, messages, iteration,
+            latent,
+            latent_state,
+            latent_config,
+            messages,
+            iteration,
         )
         trimmed = prepare_action_messages(
             action_messages,
@@ -119,10 +123,7 @@ async def run_react_loop(
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments)
-                    }
+                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
                 }
                 for tc in response.tool_calls
             ]
@@ -130,7 +131,9 @@ async def run_react_loop(
             # Add assistant message (with or without context builder)
             if context_builder:
                 messages = context_builder.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                 )
             else:
@@ -173,8 +176,11 @@ async def run_react_loop(
 
             # ── Update latent state with tool observations ──
             latent_state = await incorporate_tool_results(
-                latent, latent_state, latent_config,
-                tool_results_for_latent, iteration,
+                latent,
+                latent_state,
+                latent_config,
+                tool_results_for_latent,
+                iteration,
             )
 
             # ── Contextual reflect prompt ──
@@ -197,7 +203,9 @@ async def run_react_loop(
                     )
                     messages.append({"role": "user", "content": intervention})
                     messages[-1]["_internal"] = "intervention"
-                    logger.warning(f"{log_prefix}Circuit breaker triggered after {consecutive_error_count} error iterations")
+                    logger.warning(
+                        f"{log_prefix}Circuit breaker triggered after {consecutive_error_count} error iterations"
+                    )
                     consecutive_error_count = 0
                     recent_errors.clear()
             else:

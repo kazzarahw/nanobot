@@ -42,11 +42,12 @@ MSG_TYPE_MAP = {
 
 def _extract_post_text(content_json: dict) -> str:
     """Extract plain text from Feishu post (rich text) message content.
-    
+
     Supports two formats:
     1. Direct format: {"title": "...", "content": [...]}
     2. Localized format: {"zh_cn": {"title": "...", "content": [...]}}
     """
+
     def extract_from_lang(lang_content: dict) -> str | None:
         if not isinstance(lang_content, dict):
             return None
@@ -70,20 +71,20 @@ def _extract_post_text(content_json: dict) -> str:
                     elif tag == "at":
                         text_parts.append(f"@{element.get('user_name', 'user')}")
         return " ".join(text_parts).strip() if text_parts else None
-    
+
     # Try direct format first
     if "content" in content_json:
         result = extract_from_lang(content_json)
         if result:
             return result
-    
+
     # Try localized format
     for lang_key in ("zh_cn", "en_us", "ja_jp"):
         lang_content = content_json.get(lang_key)
         result = extract_from_lang(lang_content)
         if result:
             return result
-    
+
     return ""
 
 

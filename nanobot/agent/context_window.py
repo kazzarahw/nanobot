@@ -219,7 +219,9 @@ def _estimate_message_tokens(msg: dict[str, Any]) -> int:
     return overhead + max(1, math.ceil(len(content) / 4))
 
 
-def _force_truncate_large_contents(messages: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+def _force_truncate_large_contents(
+    messages: list[dict[str, Any]], budget: int
+) -> list[dict[str, Any]]:
     """As a final guard, truncate non-essential long text fields."""
     result = [dict(m) for m in messages]
     if estimate_tokens(result) <= budget:
