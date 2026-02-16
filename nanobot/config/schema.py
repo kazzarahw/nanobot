@@ -188,6 +188,7 @@ class LatentLoopConfig(BaseModel):
     max_latent_passes: int = 3
     latent_max_tokens: int = 1024
     latent_temperature: float = 0.3
+    latent_model: str | None = None  # Override model for latent calls (e.g. a cheaper/faster model)
     condense_tool_results: bool = True
     inject_state: bool = True
     warmup_threshold: int = 0
