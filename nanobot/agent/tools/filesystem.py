@@ -12,10 +12,32 @@ if TYPE_CHECKING:
 
 
 def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
-    """Resolve path and optionally enforce directory restriction."""
+    """Resolve path and optionally enforce directory restriction.
+
+    Also checks for likely misspelled home directories (e.g. /home/skaye
+    instead of /home/skye) and returns a helpful error.
+    """
     resolved = Path(path).expanduser().resolve()
     if allowed_dir and not str(resolved).startswith(str(allowed_dir.resolve())):
         raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+
+    # Detect misspelled /home/<user> paths
+    import re
+
+    m = re.match(r"^/home/([^/]+)", str(resolved))
+    if m:
+        user_dir = Path(f"/home/{m.group(1)}")
+        if not user_dir.exists():
+            # Find actual home directories to suggest
+            home_root = Path("/home")
+            if home_root.exists():
+                existing = [d.name for d in home_root.iterdir() if d.is_dir()]
+                suggestion = f" Existing home directories: {', '.join(sorted(existing))}" if existing else ""
+                raise FileNotFoundError(
+                    f"Home directory '{user_dir}' does not exist.{suggestion} "
+                    f"IMPORTANT: Use exact paths. Do NOT guess usernames."
+                )
+
     return resolved
 
 

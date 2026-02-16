@@ -565,8 +565,13 @@ class TestRunLatentPasses:
         reasoner = LatentReasoner(provider, "m", config)
         initial_state = LatentState(plan="old plan")
 
+        # Use a complex enough message so complexity estimation doesn't skip passes
+        complex_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Write a Python script to implement a file parser and search through all the data"},
+        ]
         state, _ = await run_latent_passes(
-            reasoner, initial_state, config, _sample_messages(), iteration=1,
+            reasoner, initial_state, config, complex_messages, iteration=1,
         )
 
         assert state.plan == "new plan"
@@ -580,8 +585,12 @@ class TestRunLatentPasses:
         # Start with the same plan — first pass returns "stable", matches input
         initial_state = LatentState(plan="stable")
 
+        complex_messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Write a Python script to implement a file parser and search through all the data"},
+        ]
         state, _ = await run_latent_passes(
-            reasoner, initial_state, config, _sample_messages(), iteration=1,
+            reasoner, initial_state, config, complex_messages, iteration=1,
         )
 
         # Only 1 pass should have run (converged immediately)
@@ -667,3 +676,279 @@ class TestCondenseMessagesPriority:
         # Tool results use 300-char limit
         assert "x" * 300 in result
         assert "x" * 301 not in result
+
+
+# ── Plan similarity tests ────────────────────────────────────────────
+
+
+class TestPlanSimilarity:
+    def test_identical_plans(self) -> None:
+        assert LatentReasoner._plan_similarity("write code", "write code") == 1.0
+
+    def test_empty_plans(self) -> None:
+        assert LatentReasoner._plan_similarity("", "") == 1.0
+
+    def test_completely_different(self) -> None:
+        sim = LatentReasoner._plan_similarity("write python code", "buy groceries tomorrow")
+        assert sim < 0.5
+
+    def test_similar_plans_above_threshold(self) -> None:
+        a = "Write a Python script to parse JSON files"
+        b = "Write a Python script to parse JSON data files"
+        sim = LatentReasoner._plan_similarity(a, b)
+        assert sim >= 0.85
+
+    def test_moderate_similarity(self) -> None:
+        a = "Implement user authentication with JWT"
+        b = "Implement user auth with JSON Web Tokens and session management"
+        sim = LatentReasoner._plan_similarity(a, b)
+        assert 0.3 < sim < 0.9
+
+
+# ── Plan drift detection tests ───────────────────────────────────────
+
+
+class TestPlanDriftDetection:
+    def test_detects_meeting_drift(self) -> None:
+        plan = "Step 1: Write the code. Step 2: Schedule meeting with team to review."
+        keywords = ["schedule meeting", "slack webhook", "team sync"]
+        assert LatentReasoner._detect_plan_drift(plan, keywords) is True
+
+    def test_detects_slack_drift(self) -> None:
+        plan = "Configure Slack webhook for notifications"
+        keywords = ["schedule meeting", "slack webhook"]
+        assert LatentReasoner._detect_plan_drift(plan, keywords) is True
+
+    def test_no_drift_on_topic(self) -> None:
+        plan = "Read the file, parse the JSON, write the output"
+        keywords = ["schedule meeting", "slack webhook", "team sync"]
+        assert LatentReasoner._detect_plan_drift(plan, keywords) is False
+
+    def test_case_insensitive(self) -> None:
+        plan = "SCHEDULE MEETING with stakeholders"
+        keywords = ["schedule meeting"]
+        assert LatentReasoner._detect_plan_drift(plan, keywords) is True
+
+    def test_empty_keywords(self) -> None:
+        plan = "Do anything at all"
+        assert LatentReasoner._detect_plan_drift(plan, []) is False
+
+
+# ── Budget exhaustion tests ──────────────────────────────────────────
+
+
+class TestBudgetExhaustion:
+    @pytest.mark.asyncio
+    async def test_token_budget_stops_refinement(self) -> None:
+        """When token budget is exhausted, refinement should be skipped."""
+        provider = _make_provider({"plan": "new plan", "key_observations": [], "uncertainties": []})
+        config = _default_config(max_latent_passes=5, max_total_latent_tokens=100)
+        reasoner = LatentReasoner(provider, "m", config)
+        # Simulate already-exhausted budget
+        reasoner.metrics.total_latent_tokens = 100
+        state = LatentState(plan="original")
+
+        result_state, _ = await run_latent_passes(
+            reasoner, state, config, _sample_messages(), iteration=1,
+        )
+
+        # Plan should be unchanged since refinement was skipped
+        assert result_state.plan == "original"
+        assert reasoner.metrics.total_passes == 0
+
+    @pytest.mark.asyncio
+    async def test_refinement_cap_stops_refinement(self) -> None:
+        """When refinement cap is reached, refinement should be skipped."""
+        provider = _make_provider({"plan": "new plan", "key_observations": [], "uncertainties": []})
+        config = _default_config(max_latent_passes=5, max_total_refinements=10)
+        reasoner = LatentReasoner(provider, "m", config)
+        # Simulate already-exhausted cap
+        reasoner.metrics.total_passes = 10
+        state = LatentState(plan="original")
+
+        result_state, _ = await run_latent_passes(
+            reasoner, state, config, _sample_messages(), iteration=1,
+        )
+
+        assert result_state.plan == "original"
+
+    @pytest.mark.asyncio
+    async def test_drift_reverts_plan(self) -> None:
+        """When plan drift is detected, the plan should revert to previous."""
+        provider = _make_provider({
+            "plan": "Write code then schedule meeting with team",
+            "key_observations": ["obs"],
+            "uncertainties": [],
+        })
+        config = _default_config(
+            max_latent_passes=3,
+            plan_drift_keywords=["schedule meeting"],
+        )
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="Write the code")
+
+        result_state, _ = await run_latent_passes(
+            reasoner, state, config, _sample_messages(), iteration=1,
+        )
+
+        # Should revert to previous plan
+        assert result_state.plan == "Write the code"
+
+    @pytest.mark.asyncio
+    async def test_similarity_convergence(self) -> None:
+        """Plans with high similarity should trigger early convergence."""
+        provider = _make_provider({
+            "plan": "Write a Python script to parse files",
+            "key_observations": [],
+            "uncertainties": [],
+        })
+        config = _default_config(
+            max_latent_passes=5,
+            convergence_similarity=0.85,
+        )
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="Write a Python script to parse data files")
+
+        await run_latent_passes(
+            reasoner, state, config,
+            [{"role": "system", "content": "sys"}, {"role": "user", "content": "Write a parser for JSON files and data transformation"}],
+            iteration=1,
+        )
+
+        # Should converge after 1 pass since plans are very similar
+        assert reasoner.metrics.converged_early >= 1
+
+
+# ── Adaptive complexity estimation tests ─────────────────────────────
+
+
+class TestEstimateComplexity:
+    def test_short_greeting_is_zero(self) -> None:
+        messages = [{"role": "user", "content": "hi"}]
+        assert LatentReasoner._estimate_complexity(messages) == 0
+
+    def test_empty_messages_is_zero(self) -> None:
+        assert LatentReasoner._estimate_complexity([]) == 0
+
+    def test_simple_question(self) -> None:
+        messages = [{"role": "user", "content": "What is the capital of France?"}]
+        c = LatentReasoner._estimate_complexity(messages)
+        assert c <= 1
+
+    def test_complex_multi_action(self) -> None:
+        messages = [{"role": "user", "content": "Write a script to create a new database, implement the migration, and deploy the service with proper configuration and search indexing"}]
+        c = LatentReasoner._estimate_complexity(messages)
+        assert c >= 2
+
+    def test_single_action_moderate(self) -> None:
+        messages = [{"role": "user", "content": "Please fix the bug in the authentication module that causes login failures"}]
+        c = LatentReasoner._estimate_complexity(messages)
+        assert c >= 1
+
+    @pytest.mark.asyncio
+    async def test_trivial_query_skips_passes(self) -> None:
+        """A trivial query (complexity=0) should skip latent passes entirely."""
+        provider = _make_provider({"plan": "new", "key_observations": [], "uncertainties": []})
+        config = _default_config(max_latent_passes=3)
+        reasoner = LatentReasoner(provider, "m", config)
+        state = LatentState(plan="original")
+
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+        ]
+        result_state, _ = await run_latent_passes(
+            reasoner, state, config, messages, iteration=1,
+        )
+
+        # No refinement calls should have been made
+        assert reasoner.metrics.total_passes == 0
+        assert result_state.plan == "original"
+
+
+# ── New config fields tests ──────────────────────────────────────────
+
+
+class TestNewLatentLoopConfigFields:
+    def test_new_defaults(self) -> None:
+        config = LatentLoopConfig()
+        assert config.max_total_latent_tokens == 50_000
+        assert config.max_total_refinements == 30
+        assert config.convergence_similarity == 0.85
+        assert isinstance(config.plan_drift_keywords, list)
+        assert len(config.plan_drift_keywords) > 0
+
+    def test_drift_keywords_overridable(self) -> None:
+        config = LatentLoopConfig(plan_drift_keywords=["custom keyword"])
+        assert config.plan_drift_keywords == ["custom keyword"]
+
+    def test_convergence_similarity_customizable(self) -> None:
+        config = LatentLoopConfig(convergence_similarity=0.95)
+        assert config.convergence_similarity == 0.95
+
+
+# ── Registry enhanced error messages tests ───────────────────────────
+
+
+class TestRegistryEnhancedErrors:
+    @pytest.mark.asyncio
+    async def test_error_includes_tool_list(self) -> None:
+        from nanobot.agent.tools.registry import ToolRegistry
+        from nanobot.agent.tools.base import Tool
+
+        class FakeTool(Tool):
+            @property
+            def name(self) -> str:
+                return "fake_tool"
+            @property
+            def description(self) -> str:
+                return "A fake tool"
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+            async def execute(self, **kwargs) -> str:
+                return "ok"
+
+        registry = ToolRegistry()
+        registry.register(FakeTool())
+        result = await registry.execute("nonexistent_tool", {})
+        assert "fake_tool" in result
+        assert "not found" in result.lower() or "not found" in result
+
+    @pytest.mark.asyncio
+    async def test_escalating_error_on_repeat(self) -> None:
+        from nanobot.agent.tools.registry import ToolRegistry
+        from nanobot.agent.tools.base import Tool
+
+        class FakeTool(Tool):
+            @property
+            def name(self) -> str:
+                return "real_tool"
+            @property
+            def description(self) -> str:
+                return "A real tool"
+            @property
+            def parameters(self) -> dict:
+                return {"type": "object", "properties": {}}
+            async def execute(self, **kwargs) -> str:
+                return "ok"
+
+        registry = ToolRegistry()
+        registry.register(FakeTool())
+
+        # First two attempts: normal error
+        await registry.execute("bad_tool", {})
+        await registry.execute("bad_tool", {})
+        # Third attempt: escalated
+        result = await registry.execute("bad_tool", {})
+        assert "STOP" in result
+        assert "3 times" in result
+
+    def test_get_error_stats(self) -> None:
+        from nanobot.agent.tools.registry import ToolRegistry
+
+        registry = ToolRegistry()
+        # Trigger some errors synchronously by accessing internal state
+        registry._invalid_tool_attempts["bad_tool"] = 5
+        stats = registry.get_error_stats()
+        assert stats == {"bad_tool": 5}

@@ -192,6 +192,18 @@ class LatentLoopConfig(BaseModel):
     condense_tool_results: bool = True
     inject_state: bool = True
     warmup_threshold: int = 0
+    max_total_latent_tokens: int = 50_000  # Session-wide token budget for latent passes
+    max_total_refinements: int = 30  # Total refinement cap across all iterations
+    convergence_similarity: float = 0.85  # Fuzzy match threshold for plan convergence
+    plan_drift_keywords: list[str] = Field(
+        default_factory=lambda: [
+            "schedule meeting",
+            "slack webhook",
+            "team sync",
+            "send email notification",
+            "finalize with team",
+        ]
+    )  # Keywords that indicate plan drift away from the user's request
 
 
 class AgentDefaults(BaseModel):

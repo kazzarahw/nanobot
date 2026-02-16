@@ -11,6 +11,7 @@ make better-informed decisions.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -50,6 +51,12 @@ Uncertainties: {uncertainties}
 
 Refine your plan.  Update observations and uncertainties based on \
 everything you know so far.  Be concise.
+
+IMPORTANT GUARDRAILS:
+- Stay focused ONLY on what the user asked. Do NOT add meetings, \
+notifications, webhooks, or tasks not requested.
+- Do NOT expand scope beyond the original request.
+- If the plan already covers what was asked, keep it as-is.
 
 Respond with ONLY a JSON object (no markdown fences):
 {{"plan": "...", "key_observations": [...], "uncertainties": [...]}}
@@ -338,6 +345,66 @@ class LatentReasoner:
         result.insert(insert_idx, state_msg)
         return result
 
+    # ── Convergence & drift helpers ──────────────────────────────────
+
+    @staticmethod
+    def _plan_similarity(a: str, b: str) -> float:
+        """Compute similarity ratio between two plan strings using SequenceMatcher."""
+        if not a and not b:
+            return 1.0
+        return difflib.SequenceMatcher(None, a, b).ratio()
+
+    @staticmethod
+    def _detect_plan_drift(plan: str, keywords: list[str]) -> bool:
+        """Return True if the plan mentions any drift keywords."""
+        plan_lower = plan.lower()
+        return any(kw.lower() in plan_lower for kw in keywords)
+
+    @staticmethod
+    def _estimate_complexity(messages: list[dict]) -> int:
+        """Estimate query complexity (0-3) based on message content.
+
+        0 = trivial (greeting, short message) → skip latent passes
+        1 = simple question
+        2 = moderate task
+        3 = complex multi-step task
+        """
+        # Extract the last user message
+        user_text = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        part.get("text", "") for part in content if isinstance(part, dict)
+                    )
+                user_text = content
+                break
+
+        if not user_text:
+            return 0
+
+        text_len = len(user_text)
+        if text_len < 20:
+            return 0
+
+        # Check for action-oriented keywords
+        action_keywords = [
+            "write", "create", "build", "implement", "fix", "debug",
+            "refactor", "deploy", "configure", "analyze", "search",
+            "edit", "modify", "update", "install",
+        ]
+        text_lower = user_text.lower()
+        action_count = sum(1 for kw in action_keywords if kw in text_lower)
+
+        if text_len < 50 and action_count == 0:
+            return 0
+        if text_len < 100 and action_count <= 1:
+            return 1
+        if action_count >= 3 or text_len > 500:
+            return 3
+        return 2
+
     # ── Internals ────────────────────────────────────────────────────
 
     async def _call_for_state(
@@ -500,19 +567,57 @@ async def run_latent_passes(
     Shared by :class:`AgentLoop` and :class:`SubagentManager` so the
     orchestration logic lives in exactly one place.
 
-    Supports early-exit: if the plan text is unchanged after a refinement
-    pass the inner loop breaks immediately.
+    Supports early-exit when the plan converges (similarity-based) or
+    drifts off-topic.  Also enforces session-wide token and refinement
+    budgets, and skips passes for trivial queries.
     """
     if reasoner is None or state is None or config is None:
         return state, messages
 
+    # Adaptive complexity: skip latent passes for trivial queries
+    complexity = LatentReasoner._estimate_complexity(messages)
+    if complexity == 0:
+        logger.debug("Latent passes skipped (trivial query, complexity=0)")
+        action_messages = messages
+        if config.inject_state:
+            action_messages = reasoner.inject(state, messages)
+        return state, action_messages
+
+    # Scale max passes by complexity (0 already handled above)
+    effective_passes = min(config.max_latent_passes, max(1, complexity))
+
     if iteration > config.warmup_threshold:
-        for _ in range(config.max_latent_passes):
+        for _ in range(effective_passes):
+            # Budget guards
+            if reasoner.metrics.total_latent_tokens >= config.max_total_latent_tokens:
+                logger.warning("Latent token budget exhausted, skipping refinement")
+                break
+            if reasoner.metrics.total_passes >= config.max_total_refinements:
+                logger.warning("Latent refinement cap reached, skipping refinement")
+                break
+
             prev_plan = state.plan
             state = await reasoner.refine(state, messages)
-            if state.plan == prev_plan:
+
+            # Drift detection
+            if LatentReasoner._detect_plan_drift(state.plan, config.plan_drift_keywords):
+                logger.warning(f"Plan drift detected, reverting to previous plan")
+                state = LatentState(
+                    plan=prev_plan,
+                    key_observations=state.key_observations,
+                    uncertainties=state.uncertainties,
+                    iteration=state.iteration,
+                    refinement_count=state.refinement_count,
+                )
+                break
+
+            # Similarity-based convergence
+            similarity = LatentReasoner._plan_similarity(prev_plan, state.plan)
+            if similarity >= config.convergence_similarity:
                 reasoner.metrics.converged_early += 1
-                logger.debug("Latent inner loop converged early (plan unchanged)")
+                logger.debug(
+                    f"Latent inner loop converged early (similarity={similarity:.2f})"
+                )
                 break
 
     action_messages = messages

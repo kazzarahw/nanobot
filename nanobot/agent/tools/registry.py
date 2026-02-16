@@ -14,6 +14,7 @@ class ToolRegistry:
 
     def __init__(self):
         self._tools: dict[str, Tool] = {}
+        self._invalid_tool_attempts: dict[str, int] = {}
 
     def register(self, tool: Tool) -> None:
         """Register a tool."""
@@ -51,7 +52,19 @@ class ToolRegistry:
         """
         tool = self._tools.get(name)
         if not tool:
-            return f"Error: Tool '{name}' not found"
+            self._invalid_tool_attempts[name] = self._invalid_tool_attempts.get(name, 0) + 1
+            attempts = self._invalid_tool_attempts[name]
+            valid_names = ", ".join(sorted(self._tools.keys()))
+            if attempts >= 3:
+                return (
+                    f"Error: STOP trying '{name}' — it does not exist and never will. "
+                    f"You have attempted it {attempts} times. "
+                    f"Use ONLY these tools: {valid_names}"
+                )
+            return (
+                f"Error: Tool '{name}' not found. "
+                f"Available tools: {valid_names}"
+            )
 
         try:
             errors = tool.validate_params(params)
@@ -60,6 +73,10 @@ class ToolRegistry:
             return await tool.execute(**params)
         except Exception as e:
             return f"Error executing {name}: {str(e)}"
+
+    def get_error_stats(self) -> dict[str, int]:
+        """Get counts of invalid tool attempts by name."""
+        return dict(self._invalid_tool_attempts)
 
     @property
     def tool_names(self) -> list[str]:

@@ -20,11 +20,17 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
 
-    def __init__(self, workspace: Path, lsp_enabled: bool = False):
+    def __init__(
+        self,
+        workspace: Path,
+        lsp_enabled: bool = False,
+        tool_names: list[str] | None = None,
+    ):
         self.workspace = workspace
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
         self.lsp_enabled = lsp_enabled
+        self.tool_names = tool_names
 
     def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
         """
@@ -82,6 +88,8 @@ Skills with available="false" need dependencies installed first - you can try in
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
+        home_dir = str(Path.home())
+
         identity = f"""# nanobot 🐈
 
 You are nanobot, a helpful AI assistant. You have access to tools that allow you to:
@@ -102,6 +110,23 @@ Your workspace is at: {workspace_path}
 - Long-term memory: {workspace_path}/memory/MEMORY.md
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
+
+## Home Directory
+IMPORTANT: The home directory is: {home_dir}
+Use exact paths. Do NOT guess usernames or fabricate paths."""
+
+        # Dynamic tool list from registry
+        if self.tool_names:
+            tool_list = ", ".join(sorted(self.tool_names))
+            identity += f"""
+
+## Available Tools (use ONLY these exact names)
+{tool_list}
+
+Do NOT attempt tools like str_replace_editor, execute_python_code, bash — they do not exist.
+If a tool call fails with "not found", check the list above and use the correct name."""
+
+        identity += f"""
 
 IMPORTANT: When responding to direct questions or conversations, reply directly with your text response.
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).

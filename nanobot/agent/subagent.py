@@ -122,7 +122,7 @@ class SubagentManager:
             tools.register(WebFetchTool())
 
             # Build messages with subagent-specific prompt
-            system_prompt = self._build_subagent_prompt(task)
+            system_prompt = self._build_subagent_prompt(task, tool_names=tools.tool_names)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -185,6 +185,8 @@ class SubagentManager:
 
                     # Execute tools
                     tool_results_for_latent: list[tuple[str, str]] = []
+                    has_errors = False
+                    error_summaries: list[str] = []
                     for tool_call in response.tool_calls:
                         args_str = json.dumps(tool_call.arguments)
                         logger.debug(
@@ -200,12 +202,30 @@ class SubagentManager:
                             }
                         )
                         tool_results_for_latent.append((tool_call.name, result))
+                        if result.startswith("Error:"):
+                            has_errors = True
+                            error_summaries.append(f"{tool_call.name}: {result[:120]}")
 
                     # ── Update latent state with tool observations ──
                     latent_state = await incorporate_tool_results(
                         latent, latent_state, self.latent_config,
                         tool_results_for_latent, iteration,
                     )
+
+                    # ── Contextual reflect prompt ──
+                    if has_errors:
+                        summary = "; ".join(error_summaries[:3])
+                        reflect = (
+                            f"Tool calls failed: {summary}. "
+                            "Fix errors or try a different approach. "
+                            "Do NOT repeat the same failing call."
+                        )
+                    else:
+                        reflect = (
+                            "Tool calls succeeded. "
+                            "Provide your final response if done, or proceed with the next action."
+                        )
+                    messages.append({"role": "user", "content": reflect})
                 else:
                     final_result = response.content
                     break
@@ -255,32 +275,44 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
             f"Subagent [{task_id}] announced result to {origin['channel']}:{origin['chat_id']}"
         )
 
-    def _build_subagent_prompt(self, task: str) -> str:
+    def _build_subagent_prompt(self, task: str, tool_names: list[str] | None = None) -> str:
         """Build a focused system prompt for the subagent."""
         import time as _time
         from datetime import datetime
+        from pathlib import Path
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = _time.strftime("%Z") or "UTC"
+        home_dir = str(Path.home())
 
-        return f"""# Subagent
+        prompt = f"""# Subagent
 
 ## Current Time
 {now} ({tz})
 
 You are a subagent spawned by the main agent to complete a specific task.
 
+## Home Directory
+IMPORTANT: The home directory is: {home_dir}
+Use exact paths. Do NOT guess usernames or fabricate paths.
+
 ## Rules
 1. Stay focused - complete only the assigned task, nothing else
 2. Your final response will be reported back to the main agent
 3. Do not initiate conversations or take on side tasks
-4. Be concise but informative in your findings
+4. Be concise but informative in your findings"""
 
-## What You Can Do
-- Read and write files in the workspace
-- Execute shell commands
-- Search the web and fetch web pages
-- Complete the task thoroughly
+        if tool_names:
+            tool_list = ", ".join(sorted(tool_names))
+            prompt += f"""
+
+## Available Tools (use ONLY these exact names)
+{tool_list}
+
+Do NOT attempt tools like str_replace_editor, execute_python_code, bash — they do not exist.
+If a tool call fails with "not found", check the list above and use the correct name."""
+
+        prompt += f"""
 
 ## What You Cannot Do
 - Send messages directly to users (no message tool available)
@@ -292,6 +324,8 @@ Your workspace is at: {self.workspace}
 Skills are available at: {self.workspace}/skills/ (read SKILL.md files as needed)
 
 When you have completed the task, provide a clear summary of your findings or actions."""
+
+        return prompt
 
     def get_running_count(self) -> int:
         """Return the number of currently running subagents."""

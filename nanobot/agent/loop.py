@@ -82,7 +82,10 @@ class AgentLoop:
 
             self.lsp_manager = LspManager(str(workspace), lsp_config)
 
-        self.context = ContextBuilder(workspace, lsp_enabled=self.lsp_manager is not None)
+        self.context = ContextBuilder(
+            workspace,
+            lsp_enabled=self.lsp_manager is not None,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
@@ -100,6 +103,8 @@ class AgentLoop:
 
         self._running = False
         self._register_default_tools()
+        # Pass registered tool names to context builder for system prompt
+        self.context.tool_names = self.tools.tool_names
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
@@ -149,6 +154,20 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
+    def _build_reflect_prompt(self, has_errors: bool, error_summaries: list[str]) -> str:
+        """Build a contextual reflect prompt based on tool execution results."""
+        if has_errors:
+            summary = "; ".join(error_summaries[:3])
+            return (
+                f"Tool calls failed: {summary}. "
+                "Fix errors or try a different approach. "
+                "Do NOT repeat the same failing call."
+            )
+        return (
+            "Tool calls succeeded. "
+            "Provide your final response if done, or proceed with the next action."
+        )
+
     async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
         """
         Run the agent iteration loop.
@@ -174,6 +193,8 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        consecutive_error_count = 0
+        recent_errors: list[str] = []
 
         # Initialize latent reasoner if enabled
         latent: LatentReasoner | None = None
@@ -216,6 +237,8 @@ class AgentLoop:
                 )
 
                 tool_results_for_latent: list[tuple[str, str]] = []
+                has_errors = False
+                error_summaries: list[str] = []
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
@@ -225,6 +248,9 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
                     tool_results_for_latent.append((tool_call.name, result))
+                    if result.startswith("Error:"):
+                        has_errors = True
+                        error_summaries.append(f"{tool_call.name}: {result[:120]}")
 
                 # ── Update latent state with tool observations ──
                 latent_state = await incorporate_tool_results(
@@ -232,7 +258,31 @@ class AgentLoop:
                     tool_results_for_latent, iteration,
                 )
 
-                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+                # ── Contextual reflect prompt ──
+                reflect = self._build_reflect_prompt(has_errors, error_summaries)
+                messages.append({"role": "user", "content": reflect})
+
+                # ── Error circuit breaker ──
+                if has_errors:
+                    consecutive_error_count += 1
+                    recent_errors.extend(error_summaries)
+                    if consecutive_error_count >= 3:
+                        valid_tools = ", ".join(sorted(self.tools.tool_names))
+                        intervention = (
+                            f"STOP. You have had {consecutive_error_count} consecutive "
+                            f"iterations with errors. Recent errors:\n"
+                            + "\n".join(f"- {e}" for e in recent_errors[-6:])
+                            + f"\n\nAvailable tools: {valid_tools}\n"
+                            "You MUST try a completely different approach. "
+                            "Do NOT repeat the same failing calls."
+                        )
+                        messages.append({"role": "user", "content": intervention})
+                        logger.warning(f"Circuit breaker triggered after {consecutive_error_count} error iterations")
+                        consecutive_error_count = 0
+                        recent_errors.clear()
+                else:
+                    consecutive_error_count = 0
+                    recent_errors.clear()
             else:
                 final_content = response.content
                 break
