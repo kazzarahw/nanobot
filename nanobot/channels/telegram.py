@@ -15,6 +15,49 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import TelegramConfig
 
+# Telegram enforces a 4096-character limit per message.
+_TELEGRAM_MAX_LENGTH = 4096
+# Conservative limit for markdown text before HTML conversion, which may expand it.
+_MARKDOWN_SPLIT_LIMIT = 3500
+
+
+def _split_text(text: str, max_length: int) -> list[str]:
+    """Split *text* into chunks that each fit within *max_length*.
+
+    Splitting prefers natural boundaries in this order:
+    paragraph breaks (``\\n\\n``), line breaks (``\\n``), spaces, and finally
+    a hard cut as a last resort.
+    """
+    if not text:
+        return []
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # Look for the best split point within the allowed window
+        split_pos = remaining.rfind("\n\n", 0, max_length)
+        if split_pos <= 0:
+            split_pos = remaining.rfind("\n", 0, max_length)
+        if split_pos <= 0:
+            split_pos = remaining.rfind(" ", 0, max_length)
+        if split_pos <= 0:
+            # No natural boundary found – hard cut
+            split_pos = max_length
+
+        chunk = remaining[:split_pos].rstrip("\n")
+        if chunk:
+            chunks.append(chunk)
+        # Skip past the boundary character(s) (newlines, spaces, etc.)
+        remaining = remaining[split_pos:].lstrip()
+
+    return chunks
+
 
 def _markdown_to_telegram_html(text: str) -> str:
     """
@@ -192,7 +235,7 @@ class TelegramChannel(BaseChannel):
             self._app = None
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a message through Telegram."""
+        """Send a message through Telegram, splitting long messages if needed."""
         if not self._app:
             logger.warning("Telegram bot not running")
             return
@@ -201,20 +244,31 @@ class TelegramChannel(BaseChannel):
         self._stop_typing(msg.chat_id)
 
         try:
-            # chat_id should be the Telegram chat ID (integer)
             chat_id = int(msg.chat_id)
-            # Convert markdown to Telegram HTML
-            html_content = _markdown_to_telegram_html(msg.content)
-            await self._app.bot.send_message(chat_id=chat_id, text=html_content, parse_mode="HTML")
         except ValueError:
             logger.error(f"Invalid chat_id: {msg.chat_id}")
-        except Exception as e:
-            # Fallback to plain text if HTML parsing fails
-            logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+            return
+
+        # Split long markdown into chunks *before* HTML conversion so each
+        # chunk produces independently valid HTML.
+        chunks = _split_text(msg.content, _MARKDOWN_SPLIT_LIMIT)
+
+        for chunk in chunks:
             try:
-                await self._app.bot.send_message(chat_id=int(msg.chat_id), text=msg.content)
-            except Exception as e2:
-                logger.error(f"Error sending Telegram message: {e2}")
+                html_content = _markdown_to_telegram_html(chunk)
+                # If HTML conversion expanded beyond the limit, split again.
+                for part in _split_text(html_content, _TELEGRAM_MAX_LENGTH):
+                    await self._app.bot.send_message(
+                        chat_id=chat_id, text=part, parse_mode="HTML"
+                    )
+            except Exception as e:
+                # Fallback to plain text if HTML parsing fails
+                logger.warning(f"HTML parse failed, falling back to plain text: {e}")
+                try:
+                    for part in _split_text(chunk, _TELEGRAM_MAX_LENGTH):
+                        await self._app.bot.send_message(chat_id=chat_id, text=part)
+                except Exception as e2:
+                    logger.error(f"Error sending Telegram message: {e2}")
 
     async def _on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command."""
